@@ -5,6 +5,7 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:firebase_core/firebase_core.dart';
 
 // Aapke lib folder ki saari 12 tool screens ke imports:
+import 'weather_screen.dart';
 import 'bmi_screen.dart';
 import 'calculator_hub_screen.dart';
 import 'expense_screen.dart';
@@ -15,8 +16,8 @@ import 'qr_barcode_screen.dart';
 import 'quick_notes_screen.dart';
 import 'study_timer_screen.dart';
 import 'todo_screen.dart';
-import 'weather_screen.dart';
 import 'wifi_drop_screen.dart';
+import 'password_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -159,6 +160,7 @@ class _UtilityDashboardScreenState extends State<UtilityDashboardScreen> {
       color: const Color(0xFFEF4444),
       screenBuilder: () => const PdfStudioScreen(),
     ),
+    
     ToolItem(
       id: 'image_resizer',
       title: 'Image Resizer',
@@ -167,6 +169,15 @@ class _UtilityDashboardScreenState extends State<UtilityDashboardScreen> {
       icon: Icons.photo_size_select_large_rounded,
       color: const Color(0xFF8B5CF6),
       screenBuilder: () => const ImageResizerScreen(),
+    ),
+    ToolItem(
+      id: 'password_generator',
+      title: 'Password Generator',
+      subtitle: 'Strong passwords banao, copy karo',
+      category: 'Security',
+      icon: Icons.password_rounded,
+      color: const Color(0xFF10B981),
+      screenBuilder: () => const PasswordScreen(),
     ),
     ToolItem(
       id: 'qr_barcode',
