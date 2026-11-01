@@ -18,6 +18,7 @@ import 'study_timer_screen.dart';
 import 'todo_screen.dart';
 import 'wifi_drop_screen.dart';
 import 'password_screen.dart';
+import 'news_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -160,7 +161,7 @@ class _UtilityDashboardScreenState extends State<UtilityDashboardScreen> {
       color: const Color(0xFFEF4444),
       screenBuilder: () => const PdfStudioScreen(),
     ),
-    
+
     ToolItem(
       id: 'image_resizer',
       title: 'Image Resizer',
@@ -241,6 +242,15 @@ class _UtilityDashboardScreenState extends State<UtilityDashboardScreen> {
       icon: Icons.wb_sunny_rounded,
       color: const Color(0xFF06B6D4),
       screenBuilder: () => const WeatherScreen(),
+    ),
+    ToolItem(
+      id: 'news',
+      title: 'Smart News',
+      subtitle: 'Live Hindi & English news',
+      category: 'Daily', // Ya aapke app mein jo category naam ho (jaise 'Utility' ya 'Productivity')
+      icon: Icons.newspaper_rounded,
+      color: const Color(0xFF2563EB),
+      screenBuilder: () => const NewsScreen(),
     ),
   ];
 
@@ -616,8 +626,6 @@ class _UtilityDashboardScreenState extends State<UtilityDashboardScreen> {
                       ),
                     ),
                   ),
-
-
 
                   // 6. TOOLS GRID
                   if (tools.isEmpty)
