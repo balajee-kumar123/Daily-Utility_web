@@ -659,7 +659,7 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                     ),
                     onPressed: () async {
                       final Uri apkUrl = Uri.parse(
-                        'sha256:249ab19e9fcf2041ee919698dd8efa87daa8dd92114367329c02272740c22694',
+                        'https://github.com/balajee-kumar123/Daily-Utility_web/releases/download/v1.0.0/app-arm64-v8a-release.apk',
                       );
                       if (await canLaunchUrl(apkUrl)) {
                         await launchUrl(
