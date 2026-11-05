@@ -659,7 +659,7 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                     ),
                     onPressed: () async {
                       final Uri apkUrl = Uri.parse(
-                        'https://github.com/balajee-kumar123/AAPKA_REPO/releases/download/v1.0.0/app-release.apk',
+                        'sha256:249ab19e9fcf2041ee919698dd8efa87daa8dd92114367329c02272740c22694',
                       );
                       if (await canLaunchUrl(apkUrl)) {
                         await launchUrl(
