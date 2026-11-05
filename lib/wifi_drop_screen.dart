@@ -318,7 +318,7 @@ class _WifiDropScreenState extends State<WifiDropScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'Server ke liye app ko Android ya Windows par run karein!',
+            'Server ke liye Home page pe diye gye apk download kijye..',
           ),
           backgroundColor: Colors.orange,
         ),
