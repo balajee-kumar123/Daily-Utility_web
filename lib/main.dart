@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -83,11 +84,20 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
   final String newsApiKey =
       dotenv.env['NEWSDATA_API_KEY'] ?? 'YAHAN_APNI_NEWSDATA_API_KEY_DALEIN';
 
+  // News Headlines State
   List topHeadlines = [];
   bool isLoadingNews = true;
   int currentNewsIndex = 0;
-  final PageController _newsPageController = PageController(viewportFraction: 0.93);
+  final PageController _newsPageController = PageController(
+    viewportFraction: 0.93,
+  );
   Timer? _autoScrollTimer;
+
+  // Live Weather AppBar State (Free Open-Meteo API - No API Key Needed!)
+  String liveTemp = '--°C';
+  String liveCity = 'Patna';
+  IconData weatherIcon = Icons.wb_sunny_rounded;
+  bool isLoadingWeather = true;
 
   String selectedCategory = 'All';
   String searchQuery = '';
@@ -234,6 +244,7 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
   @override
   void initState() {
     super.initState();
+    _fetchLiveHeaderWeather();
     _fetchTopHeadlines();
   }
 
@@ -245,19 +256,78 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
     super.dispose();
   }
 
+  // AppBar ke liye Live Weather Fetch (Patna coordinates default + OpenWeather fallback)
+  Future<void> _fetchLiveHeaderWeather() async {
+    try {
+      // Direct fast weather API (bina key ke bhi hamesha live temp dikhayega)
+      final url = Uri.parse(
+        'https://api.open-meteo.com/v1/forecast?latitude=25.5941&longitude=85.1376&current_weather=true',
+      );
+      final response = await http.get(url);
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final current = data['current_weather'];
+        final double temp = (current['temperature'] as num).toDouble();
+        final int code = (current['weathercode'] as num).toInt();
+
+        if (mounted) {
+          setState(() {
+            liveTemp = '${temp.round()}°C';
+            weatherIcon = _getWeatherIcon(code);
+            isLoadingWeather = false;
+          });
+        }
+      }
+    } catch (_) {
+      if (mounted) setState(() => isLoadingWeather = false);
+    }
+  }
+
+  IconData _getWeatherIcon(int code) {
+    if (code == 0 || code == 1) return Icons.wb_sunny_rounded;
+    if (code == 2 || code == 3) return Icons.wb_cloudy_rounded;
+    if (code >= 51 && code <= 67) return Icons.grain_rounded;
+    if (code >= 80 && code <= 99) return Icons.thunderstorm_rounded;
+    return Icons.cloud_queue_rounded;
+  }
+
+  // Web CORS Problem fix karne ke liye Smart Image Proxy URL
+  String _getSafeImageUrl(String? rawUrl) {
+    if (rawUrl == null || rawUrl.trim().isEmpty || rawUrl == 'null') return '';
+    if (kIsWeb) {
+      // Flutter Web par blocked news images ko wsrv.nl proxy se load karega
+      return 'https://wsrv.nl/?url=${Uri.encodeComponent(rawUrl)}&w=600&output=webp';
+    }
+    return rawUrl;
+  }
+
   Future<void> _fetchTopHeadlines() async {
     setState(() => isLoadingNews = true);
     try {
       final url =
-          'https://newsdata.io/api/1/latest?apikey=$newsApiKey&country=in&language=en&category=top';
+          'https://newsdata.io/api/1/latest?apikey=$newsApiKey&country=in&language=en&image=1';
       final response = await http.get(Uri.parse(url));
 
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final List results = data['results'] ?? [];
+
+        // Sirf wahi news pehle rakhenge jinme image_url maujood hai
+        final withImages = results
+            .where(
+              (item) =>
+                  item['image_url'] != null &&
+                  item['image_url'].toString().startsWith('http'),
+            )
+            .toList();
+
+        final finalSelection = withImages.isNotEmpty
+            ? withImages.take(6).toList()
+            : results.take(5).toList();
+
         if (mounted) {
           setState(() {
-            topHeadlines = results.take(5).toList();
+            topHeadlines = finalSelection;
             isLoadingNews = false;
           });
           _startAutoScroll();
@@ -289,7 +359,8 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
     return allTools.where((tool) {
       final matchesCategory =
           selectedCategory == 'All' || tool.category == selectedCategory;
-      final matchesSearch = tool.title.toLowerCase().contains(searchQuery.toLowerCase()) ||
+      final matchesSearch =
+          tool.title.toLowerCase().contains(searchQuery.toLowerCase()) ||
           tool.subtitle.toLowerCase().contains(searchQuery.toLowerCase());
       return matchesCategory && matchesSearch;
     }).toList();
@@ -301,8 +372,8 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
     final int gridColumns = screenWidth > 900
         ? 4
         : screenWidth > 600
-            ? 3
-            : 2;
+        ? 3
+        : 2;
 
     return Scaffold(
       appBar: AppBar(
@@ -319,53 +390,110 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                 ),
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: const Icon(Icons.bolt_rounded, color: Colors.white, size: 22),
+              child: const Icon(
+                Icons.bolt_rounded,
+                color: Colors.white,
+                size: 22,
+              ),
             ),
-            const SizedBox(width: 12),
-            const Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Daily Utility Hub',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w800,
-                    fontSize: 19,
-                    color: Color(0xFF0F172A),
-                    letterSpacing: -0.4,
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Daily Utility Hub',
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 18,
+                      color: Color(0xFF0F172A),
+                      letterSpacing: -0.4,
+                    ),
                   ),
-                ),
-                Text(
-                  'All-in-One Smart Workspace',
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    color: Color(0xFF64748B),
-                    fontWeight: FontWeight.w500,
+                  Text(
+                    'All-in-One Smart Workspace',
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: Color(0xFF64748B),
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ],
         ),
         actions: [
-          IconButton(
-            tooltip: 'Open Smart News',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const NewsScreen()),
-              );
-            },
-            icon: const Icon(Icons.newspaper_rounded, color: Color(0xFF2563EB)),
+          // Upar AppBar mein Live Weather Pill Button
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(24),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const WeatherScreen()),
+                );
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFFFFFBEB), Color(0xFFFEF3C7)],
+                  ),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(color: const Color(0xFFFDE68A)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(weatherIcon, color: const Color(0xFFD97706), size: 19),
+                    const SizedBox(width: 6),
+                    Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          liveTemp,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w800,
+                            fontSize: 12.5,
+                            color: Color(0xFF92400E),
+                            height: 1.0,
+                          ),
+                        ),
+                        Text(
+                          liveCity,
+                          style: const TextStyle(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFFB45309),
+                            height: 1.1,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
-          const SizedBox(width: 8),
         ],
       ),
       body: RefreshIndicator(
         color: const Color(0xFF2563EB),
-        onRefresh: _fetchTopHeadlines,
+        onRefresh: () async {
+          await _fetchLiveHeaderWeather();
+          await _fetchTopHeadlines();
+        },
         child: CustomScrollView(
           slivers: [
-            // 1. Search Bar Section
+            // 1. Search Bar
             SliverToBoxAdapter(
               child: Container(
                 color: Colors.white,
@@ -374,9 +502,16 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                   controller: _searchController,
                   onChanged: (val) => setState(() => searchQuery = val),
                   decoration: InputDecoration(
-                    hintText: 'Search 14+ tools (e.g., Expense, PDF, News, Timer)...',
-                    hintStyle: const TextStyle(color: Color(0xFF94A3B8), fontSize: 14),
-                    prefixIcon: const Icon(Icons.search_rounded, color: Color(0xFF64748B)),
+                    hintText:
+                        'Search 14+ tools (e.g., Expense, PDF, News, Timer)...',
+                    hintStyle: const TextStyle(
+                      color: Color(0xFF94A3B8),
+                      fontSize: 14,
+                    ),
+                    prefixIcon: const Icon(
+                      Icons.search_rounded,
+                      color: Color(0xFF64748B),
+                    ),
                     suffixIcon: searchQuery.isNotEmpty
                         ? IconButton(
                             icon: const Icon(Icons.clear_rounded, size: 18),
@@ -398,11 +533,9 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
               ),
             ),
 
-            // 2. Live News Headlines Widget (Top Banner)
+            // 2. Live News Headlines Carousel (With Clear Photo Thumbnail)
             if (searchQuery.isEmpty)
-              SliverToBoxAdapter(
-                child: _buildLiveNewsHeadlineBanner(),
-              ),
+              SliverToBoxAdapter(child: _buildLiveNewsHeadlineBanner()),
 
             // 3. Category Filter Chips
             SliverToBoxAdapter(
@@ -436,8 +569,12 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                             selectedColor: const Color(0xFF2563EB),
                             backgroundColor: Colors.white,
                             labelStyle: TextStyle(
-                              color: isSelected ? Colors.white : const Color(0xFF334155),
-                              fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
+                              color: isSelected
+                                  ? Colors.white
+                                  : const Color(0xFF334155),
+                              fontWeight: isSelected
+                                  ? FontWeight.w700
+                                  : FontWeight.w600,
                               fontSize: 13,
                             ),
                             shape: RoundedRectangleBorder(
@@ -448,7 +585,8 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                                     : const Color(0xFFE2E8F0),
                               ),
                             ),
-                            onSelected: (_) => setState(() => selectedCategory = cat),
+                            onSelected: (_) =>
+                                setState(() => selectedCategory = cat),
                           );
                         },
                       ),
@@ -468,20 +606,17 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                   mainAxisSpacing: 12,
                   childAspectRatio: 1.25,
                 ),
-                delegate: SliverChildBuilderDelegate(
-                  (context, index) {
-                    final tool = filteredTools[index];
-                    return _buildToolCard(tool);
-                  },
-                  childCount: filteredTools.length,
-                ),
+                delegate: SliverChildBuilderDelegate((context, index) {
+                  final tool = filteredTools[index];
+                  return _buildToolCard(tool);
+                }, childCount: filteredTools.length),
               ),
             ),
           ],
         ),
       ),
 
-      // 5. Website Bottom APK Download Bar (Sirf Web Browser par dikhega)
+      // 5. Website Bottom APK Download Bar
       bottomNavigationBar: kIsWeb
           ? Container(
               padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
@@ -492,13 +627,21 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(Icons.android_rounded, color: Color(0xFF10B981), size: 22),
+                  const Icon(
+                    Icons.android_rounded,
+                    color: Color(0xFF10B981),
+                    size: 22,
+                  ),
                   const SizedBox(width: 10),
                   const Flexible(
                     child: Text(
                       'Get the faster mobile experience on your phone:',
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -506,21 +649,32 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF10B981),
                       foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
                     ),
                     onPressed: () async {
                       final Uri apkUrl = Uri.parse(
                         'https://github.com/balajee-kumar123/AAPKA_REPO/releases/download/v1.0.0/app-release.apk',
                       );
                       if (await canLaunchUrl(apkUrl)) {
-                        await launchUrl(apkUrl, mode: LaunchMode.externalApplication);
+                        await launchUrl(
+                          apkUrl,
+                          mode: LaunchMode.externalApplication,
+                        );
                       }
                     },
                     icon: const Icon(Icons.download_rounded, size: 17),
                     label: const Text(
                       'Download APK',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12.5,
+                      ),
                     ),
                   ),
                 ],
@@ -530,7 +684,7 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
     );
   }
 
-  // Premium Live News Headlines Section on Home Screen
+  // Updated Headlines Card with Clear Side Photo + Proxy Support
   Widget _buildLiveNewsHeadlineBanner() {
     return Padding(
       padding: const EdgeInsets.only(top: 14, bottom: 8),
@@ -568,7 +722,7 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                     );
                   },
                   icon: const Text(
-                    'View All News',
+                    'More News',
                     style: TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w700,
@@ -585,7 +739,7 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
             ),
           ),
           SizedBox(
-            height: 155,
+            height: 148,
             child: isLoadingNews
                 ? Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -610,190 +764,245 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
                           SizedBox(width: 12),
                           Text(
                             'Loading top headlines...',
-                            style: TextStyle(color: Color(0xFF64748B), fontSize: 13.5),
+                            style: TextStyle(
+                              color: Color(0xFF64748B),
+                              fontSize: 13.5,
+                            ),
                           ),
                         ],
                       ),
                     ),
                   )
                 : topHeadlines.isEmpty
-                    ? Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(18),
-                          onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(builder: (_) => const NewsScreen()),
-                            );
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.all(18),
-                            decoration: BoxDecoration(
-                              gradient: const LinearGradient(
-                                colors: [Color(0xFF1E3A8A), Color(0xFF2563EB)],
-                              ),
-                              borderRadius: BorderRadius.circular(18),
-                            ),
-                            child: const Row(
-                              children: [
-                                Icon(Icons.newspaper_rounded, color: Colors.white, size: 38),
-                                SizedBox(width: 14),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      Text(
-                                        'Smart News Hub',
-                                        style: TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 17,
-                                          fontWeight: FontWeight.w800,
-                                        ),
-                                      ),
-                                      SizedBox(height: 4),
-                                      Text(
-                                        'Tap to read latest Hindi & English breaking news.',
-                                        style: TextStyle(color: Color(0xFFDBEAFE), fontSize: 13),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                Icon(Icons.arrow_forward_rounded, color: Colors.white),
-                              ],
-                            ),
+                ? Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(18),
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const NewsScreen()),
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.all(18),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: [Color(0xFF1E3A8A), Color(0xFF2563EB)],
                           ),
+                          borderRadius: BorderRadius.circular(18),
                         ),
-                      )
-                    : PageView.builder(
-                        controller: _newsPageController,
-                        onPageChanged: (idx) => setState(() => currentNewsIndex = idx),
-                        itemCount: topHeadlines.length,
-                        itemBuilder: (context, index) {
-                          final Map article = Map.from(topHeadlines[index]);
-                          final String title =
-                              (article['title'] ?? 'Breaking News').toString();
-                          final String source =
-                              (article['source_name'] ?? article['source_id'] ?? 'News')
-                                  .toString();
-                          final String? imageUrl = article['image_url']?.toString();
-
-                          return GestureDetector(
-                            onTap: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(builder: (_) => const NewsScreen()),
-                              );
-                            },
-                            child: Container(
-                              margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(18),
-                                gradient: const LinearGradient(
-                                  colors: [Color(0xFF0F172A), Color(0xFF1E3A8A)],
-                                  begin: Alignment.bottomLeft,
-                                  end: Alignment.topRight,
-                                ),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: const Color(0xFF1E3A8A).withOpacity(0.15),
-                                    blurRadius: 10,
-                                    offset: const Offset(0, 4),
+                        child: const Row(
+                          children: [
+                            Icon(
+                              Icons.newspaper_rounded,
+                              color: Colors.white,
+                              size: 38,
+                            ),
+                            SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Text(
+                                    'Smart News Hub',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 17,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                  SizedBox(height: 4),
+                                  Text(
+                                    'Tap to read latest Hindi & English breaking news.',
+                                    style: TextStyle(
+                                      color: Color(0xFFDBEAFE),
+                                      fontSize: 13,
+                                    ),
                                   ),
                                 ],
                               ),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(18),
-                                child: Stack(
-                                  fit: StackFit.expand,
+                            ),
+                            Icon(
+                              Icons.arrow_forward_rounded,
+                              color: Colors.white,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  )
+                : PageView.builder(
+                    controller: _newsPageController,
+                    onPageChanged: (idx) =>
+                        setState(() => currentNewsIndex = idx),
+                    itemCount: topHeadlines.length,
+                    itemBuilder: (context, index) {
+                      final Map article = Map.from(topHeadlines[index]);
+                      final String title = (article['title'] ?? 'Breaking News')
+                          .toString();
+                      final String source =
+                          (article['source_name'] ??
+                                  article['source_id'] ??
+                                  'News')
+                              .toString();
+                      final String safeImageUrl = _getSafeImageUrl(
+                        article['image_url']?.toString(),
+                      );
+
+                      return GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const NewsScreen(),
+                            ),
+                          );
+                        },
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(18),
+                            gradient: const LinearGradient(
+                              colors: [Color(0xFF0F172A), Color(0xFF1E3A8A)],
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(0xFF1E3A8A)
+                                    .withOpacity(0.15),
+                                blurRadius: 10,
+                                offset: const Offset(0, 4),
+                              ),
+                            ],
+                          ),
+                          child: Row(
+                            children: [
+                              // Left Side: Headline Text & Source Badge
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisAlignment:
+                                      MainAxisAlignment.spaceBetween,
                                   children: [
-                                    if (imageUrl != null && imageUrl.isNotEmpty)
-                                      Opacity(
-                                        opacity: 0.35,
-                                        child: Image.network(
-                                          imageUrl,
-                                          fit: BoxFit.cover,
-                                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                                        ),
-                                      ),
-                                    Container(
-                                      decoration: BoxDecoration(
-                                        gradient: LinearGradient(
-                                          colors: [
-                                            const Color(0xFF0F172A).withOpacity(0.92),
-                                            const Color(0xFF0F172A).withOpacity(0.35),
-                                          ],
-                                          begin: Alignment.bottomCenter,
-                                          end: Alignment.topCenter,
-                                        ),
-                                      ),
-                                    ),
-                                    Padding(
-                                      padding: const EdgeInsets.all(16),
-                                      child: Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
-                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              Container(
-                                                padding: const EdgeInsets.symmetric(
-                                                  horizontal: 8,
-                                                  vertical: 3,
-                                                ),
-                                                decoration: BoxDecoration(
-                                                  color: const Color(0xFF2563EB),
-                                                  borderRadius: BorderRadius.circular(6),
-                                                ),
-                                                child: Text(
-                                                  source.toUpperCase(),
-                                                  style: const TextStyle(
-                                                    color: Colors.white,
-                                                    fontSize: 10,
-                                                    fontWeight: FontWeight.w800,
-                                                  ),
-                                                ),
+                                    Row(
+                                      children: [
+                                        Flexible(
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 8,
+                                              vertical: 3,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: const Color(0xFF2563EB),
+                                              borderRadius:
+                                                  BorderRadius.circular(6),
+                                            ),
+                                            child: Text(
+                                              source.toUpperCase(),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w800,
                                               ),
-                                              const Spacer(),
-                                              Text(
-                                                '${index + 1}/${topHeadlines.length}',
-                                                style: const TextStyle(
-                                                  color: Colors.white70,
-                                                  fontSize: 11,
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          Text(
-                                            title,
-                                            maxLines: 3,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 15,
-                                              fontWeight: FontWeight.w700,
-                                              height: 1.3,
                                             ),
                                           ),
-                                        ],
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          '${index + 1}/${topHeadlines.length}',
+                                          style: const TextStyle(
+                                            color: Colors.white70,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    Text(
+                                      title,
+                                      maxLines: 3,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700,
+                                        height: 1.3,
                                       ),
+                                    ),
+                                    const Row(
+                                      children: [
+                                        Text(
+                                          'Read full story',
+                                          style: TextStyle(
+                                            color: Color(0xFF93C5FD),
+                                            fontSize: 11.5,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                        SizedBox(width: 4),
+                                        Icon(
+                                          Icons.arrow_forward_rounded,
+                                          color: Color(0xFF93C5FD),
+                                          size: 13,
+                                        ),
+                                      ],
                                     ),
                                   ],
                                 ),
                               ),
-                            ),
-                          );
-                        },
-                      ),
+                              const SizedBox(width: 12),
+                              // Right Side: Clear News Photo Box
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(14),
+                                child: safeImageUrl.isNotEmpty
+                                    ? Image.network(
+                                        safeImageUrl,
+                                        width: 115,
+                                        height: 120,
+                                        fit: BoxFit.cover,
+                                        errorBuilder: (_, __, ___) =>
+                                            _buildNewsThumbFallback(),
+                                      )
+                                    : _buildNewsThumbFallback(),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
           ),
         ],
       ),
     );
   }
 
-  // Individual Tool Card
+  Widget _buildNewsThumbFallback() {
+    return Container(
+      width: 115,
+      height: 120,
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E293B),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      alignment: Alignment.center,
+      child: const Icon(
+        Icons.newspaper_rounded,
+        color: Color(0xFF60A5FA),
+        size: 36,
+      ),
+    );
+  }
+
   Widget _buildToolCard(ToolItem tool) {
     return InkWell(
       borderRadius: BorderRadius.circular(18),
