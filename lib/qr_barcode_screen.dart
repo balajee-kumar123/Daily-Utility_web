@@ -608,7 +608,7 @@ class _QrBarcodeScreenState extends State<QrBarcodeScreen>
                       'UPI Payment',
                       Icons.currency_rupee,
                     ),
-                    _buildTemplateChip('wifi', Icons.wifi),
+                    _buildTemplateChip('wifi', 'Wi‑Fi', Icons.wifi),
                     _buildTemplateChip('whatsapp', 'WhatsApp', Icons.chat),
                     _buildTemplateChip(
                       'contact',
