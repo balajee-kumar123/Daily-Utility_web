@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -17,8 +16,7 @@ class TextScannerScreen extends StatefulWidget {
 }
 
 class _TextScannerScreenState extends State<TextScannerScreen> {
-  final String _ocrApiKey =
-      dotenv.env['OCR_API_KEY'] ??
+  final String _ocrApiKey = dotenv.env['OCR_API_KEY'] ??
       dotenv.env['OCR_SPACE_API_KEY'] ??
       'helloworld';
 
@@ -27,14 +25,13 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   bool _isScanning = false;
   bool _isSpeaking = false;
   String _selectedLang = 'eng'; // 'eng' = English, 'hin' = Hindi
+  String _scanMode = 'Paragraph'; // 'Paragraph' (Engine 1) or 'Code/Receipt' (Engine 2)
 
-  final TextEditingController _extractedTextController =
-      TextEditingController();
+  final TextEditingController _extractedTextController = TextEditingController();
   final ImagePicker _picker = ImagePicker();
   final FlutterTts _flutterTts = FlutterTts();
 
-  double _speechRate = 0.5;
-  double _pitch = 1.0;
+  double _speechRate = 0.5; // 0.5 in flutter_tts = 1.0x normal speed
 
   @override
   void initState() {
@@ -61,13 +58,69 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     super.dispose();
   }
 
+  // Smart Text Formatter: Fixes 1-word-per-line issues automatically
+  String _cleanExtractedText(String raw, {bool forceSingleParagraph = false}) {
+    if (raw.trim().isEmpty) return '';
+
+    String text = raw
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .replaceAll('\t', ' ');
+
+    if (forceSingleParagraph) {
+      List<String> paragraphs = text.split(RegExp(r'\n\s*\n'));
+      return paragraphs
+          .map((p) =>
+              p.replaceAll('\n', ' ').replaceAll(RegExp(r'\s+'), ' ').trim())
+          .where((p) => p.isNotEmpty)
+          .join('\n\n');
+    }
+
+    List<String> lines = text
+        .split('\n')
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+
+    if (lines.isEmpty) return '';
+
+    // Check if OCR broke words into separate lines (e.g., >45% of lines have <= 2 words)
+    if (lines.length > 2) {
+      int shortLines =
+          lines.where((l) => l.split(RegExp(r'\s+')).length <= 2).length;
+      if (shortLines / lines.length >= 0.45) {
+        return lines.join(' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+      }
+    }
+
+    // Natural sentence stitcher
+    final StringBuffer buffer = StringBuffer();
+    for (int i = 0; i < lines.length; i++) {
+      final String current = lines[i];
+      buffer.write(current);
+
+      if (i < lines.length - 1) {
+        final bool endsWithStop = RegExp(r'[.?!।:|—]$').hasMatch(current);
+        final bool nextIsList =
+            RegExp(r'^(\d+[\.\)]|[\•\-\*])\s').hasMatch(lines[i + 1]);
+        if (endsWithStop || nextIsList) {
+          buffer.write('\n');
+        } else {
+          buffer.write(' ');
+        }
+      }
+    }
+
+    return buffer.toString().replaceAll(RegExp(r' +'), ' ').trim();
+  }
+
   Future<void> _pickImageAndOpenCropper(ImageSource source) async {
     try {
       final XFile? pickedFile = await _picker.pickImage(
         source: source,
-        maxWidth: 1800,
-        maxHeight: 1800,
-        imageQuality: 90,
+        maxWidth: 1920,
+        maxHeight: 1920,
+        imageQuality: 92,
       );
 
       if (pickedFile == null) return;
@@ -80,7 +133,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       if (!mounted) return;
       await _openCropStudio(rawBytes);
     } catch (e) {
-      _showSnack('Could not pick image: $e');
+      _showSnack('Could not load image: $e');
     }
   }
 
@@ -88,7 +141,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     final Uint8List? croppedResult = await Navigator.push<Uint8List>(
       context,
       MaterialPageRoute(
-        builder: (_) => _SmartImageCropStudio(imageBytes: sourceBytes),
+        builder: (_) => _ProCropStudioScreen(imageBytes: sourceBytes),
       ),
     );
 
@@ -107,15 +160,22 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       final String base64Image =
           'data:image/png;base64,${base64Encode(imageBytes)}';
 
+      // Engine 1 is always required for Hindi & natural paragraphs
+      final String engineToUse =
+          (_selectedLang == 'hin' || _scanMode == 'Paragraph') ? '1' : '2';
+
       final response = await http.post(
         Uri.parse('https://api.ocr.space/parse/image'),
-        headers: {'apikey': _ocrApiKey.trim()},
+        headers: {
+          'apikey': _ocrApiKey.trim(),
+        },
         body: {
           'base64Image': base64Image,
           'language': _selectedLang,
           'isOverlayRequired': 'false',
           'scale': 'true',
-          'OCREngine': '2',
+          'isTable': 'false',
+          'OCREngine': engineToUse,
         },
       );
 
@@ -124,25 +184,26 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
         final List? parsedResults = data['ParsedResults'];
 
         if (parsedResults != null && parsedResults.isNotEmpty) {
-          final String text = (parsedResults[0]['ParsedText'] ?? '')
-              .toString()
-              .trim();
+          final String rawText =
+              (parsedResults[0]['ParsedText'] ?? '').toString().trim();
+
+          final String cleanedText = _cleanExtractedText(rawText);
 
           setState(() {
-            _extractedTextController.text = text.isEmpty
-                ? 'No readable text found in selected area. Try adjusting the crop box!'
-                : text;
+            _extractedTextController.text = cleanedText.isEmpty
+                ? 'No readable text detected in this area. Try cropping closer to the text.'
+                : cleanedText;
           });
         } else {
-          final String err = (data['ErrorMessage'] ?? 'Unable to extract text.')
-              .toString();
+          final String err =
+              (data['ErrorMessage'] ?? 'Could not recognize text.').toString();
           _showSnack(err);
         }
       } else {
-        _showSnack('Server error: ${response.statusCode}');
+        _showSnack('OCR Server Error (${response.statusCode})');
       }
     } catch (e) {
-      _showSnack('Network error while scanning text.');
+      _showSnack('Connection error. Please check your internet.');
     } finally {
       if (mounted) setState(() => _isScanning = false);
     }
@@ -151,7 +212,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   Future<void> _toggleVoiceReader() async {
     final text = _extractedTextController.text.trim();
     if (text.isEmpty) {
-      _showSnack('No text to read! Scan an image or type something first.');
+      _showSnack('Extract or type some text first to listen.');
       return;
     }
 
@@ -161,7 +222,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     } else {
       await _flutterTts.setLanguage(_selectedLang == 'hin' ? 'hi-IN' : 'en-IN');
       await _flutterTts.setSpeechRate(_speechRate);
-      await _flutterTts.setPitch(_pitch);
+      await _flutterTts.setPitch(1.0);
       setState(() => _isSpeaking = true);
       await _flutterTts.speak(text);
     }
@@ -169,57 +230,86 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
 
   void _copyText() {
     final text = _extractedTextController.text.trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty) {
+      _showSnack('Nothing to copy yet!');
+      return;
+    }
     Clipboard.setData(ClipboardData(text: text));
-    _showSnack('Text copied to clipboard!');
+    _showSnack('Copied to clipboard!');
   }
 
   void _showSnack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+      SnackBar(
+        content: Text(msg, style: const TextStyle(fontWeight: FontWeight.w600)),
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: const Color(0xFF0F172A),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final int wordCount = _extractedTextController.text.trim().isEmpty
-        ? 0
-        : _extractedTextController.text.trim().split(RegExp(r'\s+')).length;
+    final String currentText = _extractedTextController.text.trim();
+    final int wordCount =
+        currentText.isEmpty ? 0 : currentText.split(RegExp(r'\s+')).length;
     final int charCount = _extractedTextController.text.length;
+    final int lineCount =
+        currentText.isEmpty ? 0 : currentText.split('\n').length;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF8FAFC),
+      backgroundColor: const Color(0xFFF1F5F9),
       appBar: AppBar(
         elevation: 0,
-        backgroundColor: Colors.white,
-        foregroundColor: const Color(0xFF0F172A),
+        scrolledUnderElevation: 0,
+        backgroundColor: const Color(0xFF0F172A),
+        foregroundColor: Colors.white,
         title: Row(
           children: [
             Container(
-              padding: const EdgeInsets.all(8),
+              padding: const EdgeInsets.all(7),
               decoration: BoxDecoration(
-                color: const Color(0xFF2563EB).withOpacity(0.12),
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF6366F1), Color(0xFF3B82F6)],
+                ),
                 borderRadius: BorderRadius.circular(10),
               ),
               child: const Icon(
                 Icons.document_scanner_rounded,
-                color: Color(0xFF2563EB),
-                size: 22,
+                color: Colors.white,
+                size: 20,
               ),
             ),
             const SizedBox(width: 10),
-            const Text(
-              'Smart OCR & Crop Studio',
-              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+            const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Vision OCR Studio',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 16.5,
+                    letterSpacing: -0.3,
+                  ),
+                ),
+                Text(
+                  'Smart Crop • Paragraph AI • Voice Reader',
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    color: Color(0xFF94A3B8),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
             ),
           ],
         ),
         actions: [
-          if (_croppedImageBytes != null ||
-              _extractedTextController.text.isNotEmpty)
+          if (_croppedImageBytes != null || currentText.isNotEmpty)
             IconButton(
-              tooltip: 'Reset All',
+              tooltip: 'Reset Workspace',
               onPressed: () {
                 _flutterTts.stop();
                 setState(() {
@@ -229,128 +319,105 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                   _isSpeaking = false;
                 });
               },
-              icon: const Icon(
-                Icons.delete_sweep_rounded,
-                color: Color(0xFFEF4444),
-              ),
+              icon: const Icon(Icons.restart_alt_rounded, color: Color(0xFFF87171)),
             ),
+          const SizedBox(width: 4),
         ],
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // 1. Language & Image Picker Controls
+            // 1. TOP DARK HERO CONTROL DECK
             Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: const Color(0xFFE2E8F0)),
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+              decoration: const BoxDecoration(
+                color: Color(0xFF0F172A),
+                borderRadius: BorderRadius.vertical(bottom: Radius.circular(28)),
               ),
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      const Icon(
-                        Icons.translate_rounded,
-                        size: 18,
-                        color: Color(0xFF2563EB),
-                      ),
-                      const SizedBox(width: 6),
-                      const Text(
-                        'OCR Language:',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w700,
-                          fontSize: 13.5,
-                          color: Color(0xFF334155),
+                  // Language & Mode Segmented Bar
+                  Container(
+                    padding: const EdgeInsets.all(5),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E293B),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: Colors.white.withOpacity(0.07)),
+                    ),
+                    child: Row(
+                      children: [
+                        _buildLangTab('eng', '🇬🇧 English'),
+                        const SizedBox(width: 6),
+                        _buildLangTab('hin', '🇮🇳 हिंदी (Hindi)'),
+                        const Spacer(),
+                        // Mode badge
+                        GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              _scanMode = _scanMode == 'Paragraph'
+                                  ? 'Receipt/Numbers'
+                                  : 'Paragraph';
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 7,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF334155),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(
+                                  Icons.auto_awesome_rounded,
+                                  size: 13,
+                                  color: Color(0xFF38BDF8),
+                                ),
+                                const SizedBox(width: 5),
+                                Text(
+                                  _scanMode,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
-                      ),
-                      const Spacer(),
-                      ChoiceChip(
-                        showCheckmark: false,
-                        label: const Text('English'),
-                        selected: _selectedLang == 'eng',
-                        selectedColor: const Color(0xFF2563EB),
-                        labelStyle: TextStyle(
-                          color: _selectedLang == 'eng'
-                              ? Colors.white
-                              : const Color(0xFF334155),
-                          fontWeight: FontWeight.w700,
-                          fontSize: 12,
-                        ),
-                        onSelected: (_) =>
-                            setState(() => _selectedLang = 'eng'),
-                      ),
-                      const SizedBox(width: 8),
-                      ChoiceChip(
-                        showCheckmark: false,
-                        label: const Text('Hindi (हिंदी)'),
-                        selected: _selectedLang == 'hin',
-                        selectedColor: const Color(0xFF2563EB),
-                        labelStyle: TextStyle(
-                          color: _selectedLang == 'hin'
-                              ? Colors.white
-                              : const Color(0xFF334155),
-                          fontWeight: FontWeight.w700,
-                          fontSize: 12,
-                        ),
-                        onSelected: (_) =>
-                            setState(() => _selectedLang = 'hin'),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                   const SizedBox(height: 14),
+
+                  // Dual Upload & Camera Cards
                   Row(
                     children: [
                       Expanded(
-                        child: ElevatedButton.icon(
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF2563EB),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 13),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                          onPressed: _isScanning
+                        child: _buildCaptureButton(
+                          title: 'Upload Photo',
+                          subtitle: 'Gallery & Crop',
+                          icon: Icons.add_photo_alternate_rounded,
+                          isPrimary: true,
+                          onTap: _isScanning
                               ? null
-                              : () => _pickImageAndOpenCropper(
-                                  ImageSource.gallery,
-                                ),
-                          icon: const Icon(
-                            Icons.photo_library_rounded,
-                            size: 20,
-                          ),
-                          label: const Text(
-                            'Gallery & Crop',
-                            style: TextStyle(fontWeight: FontWeight.w700),
-                          ),
+                              : () => _pickImageAndOpenCropper(ImageSource.gallery),
                         ),
                       ),
-                      const SizedBox(width: 10),
+                      const SizedBox(width: 12),
                       Expanded(
-                        child: OutlinedButton.icon(
-                          style: OutlinedButton.styleFrom(
-                            foregroundColor: const Color(0xFF0F172A),
-                            side: const BorderSide(color: Color(0xFFCBD5E1)),
-                            padding: const EdgeInsets.symmetric(vertical: 13),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                          onPressed: _isScanning
+                        child: _buildCaptureButton(
+                          title: 'Scan Camera',
+                          subtitle: 'Snap & Crop',
+                          icon: Icons.camera_enhance_rounded,
+                          isPrimary: false,
+                          onTap: _isScanning
                               ? null
-                              : () => _pickImageAndOpenCropper(
-                                  ImageSource.camera,
-                                ),
-                          icon: const Icon(Icons.camera_alt_rounded, size: 20),
-                          label: const Text(
-                            'Camera & Crop',
-                            style: TextStyle(fontWeight: FontWeight.w700),
-                          ),
+                              : () => _pickImageAndOpenCropper(ImageSource.camera),
                         ),
                       ),
                     ],
@@ -359,297 +426,469 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               ),
             ),
 
-            const SizedBox(height: 16),
-
-            // 2. Cropped Image Preview + Re-Crop & Re-Scan Controls
-            if (_croppedImageBytes != null)
-              Container(
-                margin: const EdgeInsets.only(bottom: 16),
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: const Color(0xFFE2E8F0)),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  // 2. CROPPED IMAGE PREVIEW CARD (Shows when image is selected)
+                  if (_croppedImageBytes != null)
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF0F172A).withOpacity(0.05),
+                            blurRadius: 15,
+                            offset: const Offset(0, 5),
                           ),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFDCFCE7),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: const Text(
-                            'CROPPED SELECTION',
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w800,
-                              color: Color(0xFF15803D),
-                            ),
-                          ),
-                        ),
-                        const Spacer(),
-                        if (_originalImageBytes != null)
-                          TextButton.icon(
-                            onPressed: _isScanning
-                                ? null
-                                : () => _openCropStudio(_originalImageBytes!),
-                            icon: const Icon(
-                              Icons.crop_rotate_rounded,
-                              size: 16,
-                            ),
-                            label: const Text(
-                              'Adjust Crop Area',
-                              style: TextStyle(
-                                fontWeight: FontWeight.w700,
-                                fontSize: 12.5,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Container(
-                        width: double.infinity,
-                        constraints: const BoxConstraints(maxHeight: 190),
-                        color: const Color(0xFFF1F5F9),
-                        child: Image.memory(
-                          _croppedImageBytes!,
-                          fit: BoxFit.contain,
-                        ),
+                        ],
                       ),
-                    ),
-                    if (_isScanning) ...[
-                      const SizedBox(height: 14),
-                      const Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
+                      child: Column(
                         children: [
-                          SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2.5),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(14, 10, 10, 6),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 8,
+                                  height: 8,
+                                  decoration: BoxDecoration(
+                                    color: _isScanning
+                                        ? const Color(0xFFF59E0B)
+                                        : const Color(0xFF10B981),
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  _isScanning
+                                      ? 'AI Scanning in Progress...'
+                                      : 'Cropped Region Ready',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 12.5,
+                                    color: Color(0xFF334155),
+                                  ),
+                                ),
+                                const Spacer(),
+                                if (_originalImageBytes != null)
+                                  TextButton.icon(
+                                    style: TextButton.styleFrom(
+                                      visualDensity: VisualDensity.compact,
+                                      foregroundColor: const Color(0xFF4F46E5),
+                                    ),
+                                    onPressed: _isScanning
+                                        ? null
+                                        : () => _openCropStudio(_originalImageBytes!),
+                                    icon: const Icon(Icons.crop_rounded, size: 15),
+                                    label: const Text(
+                                      'Re-Crop',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ),
+                                TextButton.icon(
+                                  style: TextButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    foregroundColor: const Color(0xFF0F172A),
+                                  ),
+                                  onPressed: _isScanning
+                                      ? null
+                                      : () => _performOcr(_croppedImageBytes!),
+                                  icon: const Icon(Icons.refresh_rounded, size: 15),
+                                  label: const Text(
+                                    'Rescan',
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                          SizedBox(width: 10),
-                          Text(
-                            'Extracting text from cropped area...',
-                            style: TextStyle(
-                              fontWeight: FontWeight.w700,
-                              color: Color(0xFF2563EB),
+                          Container(
+                            width: double.infinity,
+                            margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                            padding: const EdgeInsets.all(8),
+                            constraints: const BoxConstraints(maxHeight: 165),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFF8FAFC),
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(color: const Color(0xFFE2E8F0)),
+                            ),
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: Image.memory(
+                                    _croppedImageBytes!,
+                                    fit: BoxFit.contain,
+                                  ),
+                                ),
+                                if (_isScanning)
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 16,
+                                      vertical: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF0F172A).withOpacity(0.82),
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        SizedBox(
+                                          width: 16,
+                                          height: 16,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2.2,
+                                            color: Color(0xFF38BDF8),
+                                          ),
+                                        ),
+                                        SizedBox(width: 10),
+                                        Text(
+                                          'Reading lines...',
+                                          style: TextStyle(
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.w700,
+                                            fontSize: 12.5,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                              ],
                             ),
                           ),
                         ],
                       ),
-                    ] else ...[
-                      const SizedBox(height: 8),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: TextButton.icon(
-                          onPressed: () => _performOcr(_croppedImageBytes!),
-                          icon: const Icon(Icons.replay_rounded, size: 16),
-                          label: const Text('Re-Scan Selection'),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
+                    ),
 
-            // 3. AI Voice Reader (TTS) Studio Card
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF0F172A), Color(0xFF1E3A8A)],
-                ),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Column(
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Icon(
-                          _isSpeaking
-                              ? Icons.graphic_eq_rounded
-                              : Icons.record_voice_over_rounded,
-                          color: const Color(0xFF60A5FA),
-                          size: 24,
-                        ),
+                  // 3. COMPACT AI VOICE PLAYER BAR
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF1E1B4B), Color(0xFF312E81)],
                       ),
-                      const SizedBox(width: 12),
-                      const Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'AI Voice Reader (TTS)',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w800,
-                                fontSize: 15.5,
+                      borderRadius: BorderRadius.circular(18),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF312E81).withOpacity(0.22),
+                          blurRadius: 12,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        GestureDetector(
+                          onTap: _toggleVoiceReader,
+                          child: Container(
+                            width: 42,
+                            height: 42,
+                            decoration: BoxDecoration(
+                              color: _isSpeaking
+                                  ? const Color(0xFFEF4444)
+                                  : const Color(0xFF6366F1),
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              _isSpeaking
+                                  ? Icons.stop_rounded
+                                  : Icons.play_arrow_rounded,
+                              color: Colors.white,
+                              size: 24,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _isSpeaking
+                                    ? 'Speaking Aloud...'
+                                    : 'AI Voice Reader',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                _selectedLang == 'hin'
+                                    ? 'Hindi Voice Engine Ready'
+                                    : 'English Voice Engine Ready',
+                                style: const TextStyle(
+                                  color: Color(0xFFA5B4FC),
+                                  fontSize: 11.5,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        // Speed Selector Pills
+                        ...[0.38, 0.5, 0.65, 0.8].map((rate) {
+                          final String label = rate == 0.38
+                              ? '0.75x'
+                              : rate == 0.5
+                                  ? '1x'
+                                  : rate == 0.65
+                                      ? '1.25x'
+                                      : '1.5x';
+                          final bool active = (_speechRate - rate).abs() < 0.05;
+                          return GestureDetector(
+                            onTap: () => setState(() => _speechRate = rate),
+                            child: Container(
+                              margin: const EdgeInsets.only(left: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 7,
+                                vertical: 5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: active
+                                    ? Colors.white
+                                    : Colors.white.withOpacity(0.12),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                label,
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w800,
+                                  color: active
+                                      ? const Color(0xFF1E1B4B)
+                                      : Colors.white,
+                                ),
                               ),
                             ),
-                            Text(
-                              'Listen to cropped text or pasted notes aloud',
-                              style: TextStyle(
-                                color: Color(0xFF93C5FD),
-                                fontSize: 12,
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // 4. SMART TEXT WORKSPACE CARD
+                  Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(22),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF0F172A).withOpacity(0.04),
+                          blurRadius: 16,
+                          offset: const Offset(0, 6),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // Header + Action Toolbar
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 14, 14, 10),
+                          child: Row(
+                            children: [
+                              const Icon(
+                                Icons.article_rounded,
+                                size: 19,
+                                color: Color(0xFF4F46E5),
                               ),
+                              const SizedBox(width: 8),
+                              const Text(
+                                'Extracted Text Studio',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 15,
+                                  color: Color(0xFF0F172A),
+                                ),
+                              ),
+                              const Spacer(),
+                              // 1-Click Copy Button
+                              ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF4F46E5),
+                                  foregroundColor: Colors.white,
+                                  elevation: 0,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 8,
+                                  ),
+                                  minimumSize: Size.zero,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                ),
+                                onPressed: _copyText,
+                                icon: const Icon(Icons.copy_rounded, size: 15),
+                                label: const Text(
+                                  'Copy',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 12.5,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+
+                        // Quick Text Cleanup Chips (Fixes broken lines in 1 click)
+                        SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                          child: Row(
+                            children: [
+                              _buildTextToolChip(
+                                icon: Icons.wrap_text_rounded,
+                                label: 'Join Broken Lines',
+                                onTap: () {
+                                  if (currentText.isEmpty) return;
+                                  setState(() {
+                                    _extractedTextController.text =
+                                        _cleanExtractedText(
+                                      _extractedTextController.text,
+                                      forceSingleParagraph: true,
+                                    );
+                                  });
+                                  _showSnack(
+                                    'All broken lines merged into clean sentences!',
+                                  );
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTextToolChip(
+                                icon: Icons.space_bar_rounded,
+                                label: 'Clean Extra Spaces',
+                                onTap: () {
+                                  if (currentText.isEmpty) return;
+                                  setState(() {
+                                    _extractedTextController.text =
+                                        _extractedTextController.text
+                                            .replaceAll(RegExp(r'[ \t]+'), ' ')
+                                            .trim();
+                                  });
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTextToolChip(
+                                icon: Icons.text_fields_rounded,
+                                label: 'UPPERCASE',
+                                onTap: () {
+                                  if (currentText.isEmpty) return;
+                                  setState(() {
+                                    _extractedTextController.text =
+                                        _extractedTextController.text
+                                            .toUpperCase();
+                                  });
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              _buildTextToolChip(
+                                icon: Icons.format_size,
+                                label: 'lowercase',
+                                onTap: () {
+                                  if (currentText.isEmpty) return;
+                                  setState(() {
+                                    _extractedTextController.text =
+                                        _extractedTextController.text
+                                            .toLowerCase();
+                                  });
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+
+                        const SizedBox(height: 8),
+                        const Divider(height: 1, color: Color(0xFFE2E8F0)),
+
+                        // Editable Text Area
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 6,
+                          ),
+                          child: TextField(
+                            controller: _extractedTextController,
+                            maxLines: 12,
+                            minLines: 7,
+                            onChanged: (_) => setState(() {}),
+                            style: const TextStyle(
+                              fontSize: 15,
+                              height: 1.6,
+                              color: Color(0xFF1E293B),
+                              fontWeight: FontWeight.w500,
                             ),
-                          ],
-                        ),
-                      ),
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _isSpeaking
-                              ? const Color(0xFFEF4444)
-                              : const Color(0xFF10B981),
-                          foregroundColor: Colors.white,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
+                            decoration: const InputDecoration(
+                              hintText:
+                                  '1. Upload a photo or take a picture.\n2. Drag the corner brackets to crop the exact paragraph.\n3. Clean, formatted text will appear here automatically!',
+                              hintStyle: TextStyle(
+                                color: Color(0xFF94A3B8),
+                                fontSize: 13.5,
+                                height: 1.6,
+                              ),
+                              border: InputBorder.none,
+                            ),
                           ),
                         ),
-                        onPressed: _toggleVoiceReader,
-                        icon: Icon(
-                          _isSpeaking
-                              ? Icons.stop_rounded
-                              : Icons.play_arrow_rounded,
-                        ),
-                        label: Text(
-                          _isSpeaking ? 'Stop' : 'Listen',
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      const Text(
-                        'Speed:',
-                        style: TextStyle(color: Colors.white70, fontSize: 12),
-                      ),
-                      Expanded(
-                        child: Slider(
-                          value: _speechRate,
-                          min: 0.2,
-                          max: 1.0,
-                          activeColor: const Color(0xFF60A5FA),
-                          inactiveColor: Colors.white24,
-                          onChanged: (val) => setState(() => _speechRate = val),
-                        ),
-                      ),
-                      Text(
-                        '${(_speechRate * 2).toStringAsFixed(1)}x',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
 
-            const SizedBox(height: 16),
-
-            // 4. Extracted / Editable Text Box
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: const Color(0xFFE2E8F0)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Text(
-                        'Extracted / Editable Text',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w800,
-                          fontSize: 15,
-                          color: Color(0xFF0F172A),
-                        ),
-                      ),
-                      const Spacer(),
-                      FilledButton.tonalIcon(
-                        onPressed: _copyText,
-                        icon: const Icon(Icons.copy_rounded, size: 16),
-                        label: const Text(
-                          'Copy Text',
-                          style: TextStyle(
-                            fontWeight: FontWeight.w700,
-                            fontSize: 12.5,
+                        // Bottom Stats Footer
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 10,
+                          ),
+                          decoration: const BoxDecoration(
+                            color: Color(0xFFF8FAFC),
+                            borderRadius: BorderRadius.vertical(
+                              bottom: Radius.circular(22),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              _buildStatBadge('$wordCount Words'),
+                              const SizedBox(width: 8),
+                              _buildStatBadge('$charCount Chars'),
+                              const SizedBox(width: 8),
+                              _buildStatBadge('$lineCount Lines'),
+                              const Spacer(),
+                              if (currentText.isNotEmpty)
+                                InkWell(
+                                  onTap: () {
+                                    _extractedTextController.clear();
+                                    setState(() {});
+                                  },
+                                  child: const Text(
+                                    'Clear',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w800,
+                                      color: Color(0xFFEF4444),
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
-                      ),
-                    ],
-                  ),
-                  const Divider(height: 16),
-                  TextField(
-                    controller: _extractedTextController,
-                    maxLines: 10,
-                    minLines: 6,
-                    onChanged: (_) => setState(() {}),
-                    style: const TextStyle(
-                      fontSize: 14.5,
-                      height: 1.5,
-                      color: Color(0xFF1E293B),
+                      ],
                     ),
-                    decoration: const InputDecoration(
-                      hintText: 'Pick an image -> Drag the corners to crop the exact paragraph or formula -> Extracted text will appear here!',
-                      hintStyle: TextStyle(
-                        color: Color(0xFF94A3B8),
-                        fontSize: 13.5,
-                      ),
-                      border: InputBorder.none,
-                    ),
-                  ),
-                  const Divider(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        '$wordCount words • $charCount characters',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: Color(0xFF64748B),
-                        ),
-                      ),
-                      InkWell(
-                        onTap: () {
-                          _extractedTextController.clear();
-                          setState(() {});
-                        },
-                        child: const Text(
-                          'Clear Text',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w700,
-                            color: Color(0xFFEF4444),
-                          ),
-                        ),
-                      ),
-                    ],
                   ),
                 ],
               ),
@@ -659,26 +898,163 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       ),
     );
   }
+
+  Widget _buildLangTab(String code, String label) {
+    final bool selected = _selectedLang == code;
+    return GestureDetector(
+      onTap: () => setState(() => _selectedLang = code),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF4F46E5) : Colors.transparent,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: selected ? Colors.white : const Color(0xFF94A3B8),
+            fontWeight: FontWeight.w800,
+            fontSize: 12.5,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCaptureButton({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required bool isPrimary,
+    required VoidCallback? onTap,
+  }) {
+    return Material(
+      color: isPrimary ? const Color(0xFF4F46E5) : const Color(0xFF1E293B),
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isPrimary
+                  ? const Color(0xFF818CF8).withOpacity(0.4)
+                  : Colors.white.withOpacity(0.1),
+            ),
+          ),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(9),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.14),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: Colors.white, size: 22),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w800,
+                        fontSize: 13.5,
+                      ),
+                    ),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.7),
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextToolChip({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF1F5F9),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFFE2E8F0)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, size: 15, color: const Color(0xFF475569)),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF334155),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatBadge(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE2E8F0).withOpacity(0.7),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          color: Color(0xFF475569),
+        ),
+      ),
+    );
+  }
 }
 
 // ============================================================================
-// BUILT-IN INTERACTIVE CROP & ROTATE STUDIO (WEB + ANDROID COMPATIBLE)
+// PRO INTERACTIVE CROP & ROTATE STUDIO (L-BRACKET SCANNER UI)
 // ============================================================================
-class _SmartImageCropStudio extends StatefulWidget {
+class _ProCropStudioScreen extends StatefulWidget {
   final Uint8List imageBytes;
 
-  const _SmartImageCropStudio({required this.imageBytes});
+  const _ProCropStudioScreen({required this.imageBytes});
 
   @override
-  State<_SmartImageCropStudio> createState() => _SmartImageCropStudioState();
+  State<_ProCropStudioScreen> createState() => _ProCropStudioScreenState();
 }
 
-class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
+class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
   ui.Image? _decodedImage;
   bool _isProcessing = false;
 
-  // Normalized Crop Box Coordinates (0.0 to 1.0 relative to displayed image)
-  Rect _cropRect = const Rect.fromLTWH(0.1, 0.15, 0.8, 0.7);
+  // Normalized Crop Box (0.0 to 1.0)
+  Rect _cropRect = const Rect.fromLTWH(0.08, 0.15, 0.84, 0.65);
 
   @override
   void initState() {
@@ -696,7 +1072,6 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
     }
   }
 
-  // Rotate image 90 degrees clockwise on canvas
   Future<void> _rotateImage90() async {
     if (_decodedImage == null || _isProcessing) return;
     setState(() => _isProcessing = true);
@@ -713,21 +1088,18 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
     canvas.drawImage(src, Offset.zero, Paint());
 
     final ui.Picture picture = recorder.endRecording();
-    final ui.Image rotated = await picture.toImage(
-      newWidth.toInt(),
-      newHeight.toInt(),
-    );
+    final ui.Image rotated =
+        await picture.toImage(newWidth.toInt(), newHeight.toInt());
 
     if (mounted) {
       setState(() {
         _decodedImage = rotated;
-        _cropRect = const Rect.fromLTWH(0.1, 0.15, 0.8, 0.7);
+        _cropRect = const Rect.fromLTWH(0.08, 0.15, 0.84, 0.65);
         _isProcessing = false;
       });
     }
   }
 
-  // Crop selected normalized rectangle from actual high-res image
   Future<void> _confirmAndCrop() async {
     if (_decodedImage == null || _isProcessing) return;
     setState(() => _isProcessing = true);
@@ -756,9 +1128,8 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
         srcRect.height.toInt(),
       );
 
-      final ByteData? byteData = await croppedUiImage.toByteData(
-        format: ui.ImageByteFormat.png,
-      );
+      final ByteData? byteData =
+          await croppedUiImage.toByteData(format: ui.ImageByteFormat.png);
 
       if (byteData != null && mounted) {
         Navigator.pop(context, byteData.buffer.asUint8List());
@@ -770,45 +1141,33 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
     }
   }
 
-  void _setPresetCrop(Rect preset) {
-    setState(() => _cropRect = preset);
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0F172A),
+      backgroundColor: const Color(0xFF090D16),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0F172A),
+        backgroundColor: const Color(0xFF090D16),
         foregroundColor: Colors.white,
+        elevation: 0,
         title: const Text(
-          'Crop Text Area',
-          style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18),
+          'Select Scan Region',
+          style: TextStyle(fontWeight: FontWeight.w800, fontSize: 17),
         ),
         actions: [
-          TextButton.icon(
+          IconButton(
+            tooltip: 'Rotate 90°',
             onPressed: _rotateImage90,
-            icon: const Icon(
-              Icons.rotate_90_degrees_cw_rounded,
-              color: Colors.white,
-              size: 18,
-            ),
-            label: const Text(
-              'Rotate',
-              style: TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
+            icon: const Icon(Icons.rotate_90_degrees_cw_rounded),
           ),
           TextButton(
-            onPressed: () =>
-                _setPresetCrop(const Rect.fromLTWH(0.0, 0.0, 1.0, 1.0)),
+            onPressed: () => setState(
+              () => _cropRect = const Rect.fromLTWH(0.02, 0.02, 0.96, 0.96),
+            ),
             child: const Text(
-              'Full Image',
+              'Select All',
               style: TextStyle(
-                color: Color(0xFF60A5FA),
-                fontWeight: FontWeight.w700,
+                color: Color(0xFF818CF8),
+                fontWeight: FontWeight.w800,
               ),
             ),
           ),
@@ -818,17 +1177,21 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
           ? const Center(child: CircularProgressIndicator(color: Colors.white))
           : Column(
               children: [
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  child: Text(
-                    'Drag the blue corners or inside the box to select the exact lines you want to scan',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white70, fontSize: 12.5),
+                Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.07),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Text(
+                    'Drag corners or center box to frame the exact paragraph',
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                 ),
                 Expanded(
                   child: Padding(
-                    padding: const EdgeInsets.all(20),
+                    padding: const EdgeInsets.all(24),
                     child: LayoutBuilder(
                       builder: (context, constraints) {
                         final double imgAspect =
@@ -859,24 +1222,20 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                             child: Stack(
                               clipBehavior: Clip.none,
                               children: [
-                                // Base Image
                                 Positioned.fill(
                                   child: RawImage(
                                     image: _decodedImage,
                                     fit: BoxFit.fill,
                                   ),
                                 ),
-
-                                // Dark Overlay + Grid Lines Painter
                                 Positioned.fill(
                                   child: CustomPaint(
-                                    painter: _CropOverlayPainter(
+                                    painter: _ProScannerOverlayPainter(
                                       cropRect: pixelCrop,
                                     ),
                                   ),
                                 ),
-
-                                // Center Drag Area (Move entire crop box)
+                                // Drag Inside Box
                                 Positioned.fromRect(
                                   rect: pixelCrop,
                                   child: GestureDetector(
@@ -885,11 +1244,8 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                                       setState(() {
                                         final double dx = d.delta.dx / renderW;
                                         final double dy = d.delta.dy / renderH;
-                                        final double newL =
-                                            (_cropRect.left + dx).clamp(
-                                              0.0,
-                                              1.0 - _cropRect.width,
-                                            );
+                                        final double newL = (_cropRect.left + dx)
+                                            .clamp(0.0, 1.0 - _cropRect.width);
                                         final double newT = (_cropRect.top + dy)
                                             .clamp(0.0, 1.0 - _cropRect.height);
                                         _cropRect = Rect.fromLTWH(
@@ -902,25 +1258,18 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                                     },
                                   ),
                                 ),
-
-                                // 4 Draggable Corner Handles
-                                _buildCornerHandle(
-                                  left: pixelCrop.left - 14,
-                                  top: pixelCrop.top - 14,
+                                // 4 Corner Touch Zones
+                                _buildTouchCorner(
+                                  left: pixelCrop.left - 18,
+                                  top: pixelCrop.top - 18,
                                   onDrag: (d) {
                                     setState(() {
                                       final double nl =
                                           (_cropRect.left + d.dx / renderW)
-                                              .clamp(
-                                                0.0,
-                                                _cropRect.right - 0.12,
-                                              );
+                                              .clamp(0.0, _cropRect.right - 0.12);
                                       final double nt =
                                           (_cropRect.top + d.dy / renderH)
-                                              .clamp(
-                                                0.0,
-                                                _cropRect.bottom - 0.10,
-                                              );
+                                              .clamp(0.0, _cropRect.bottom - 0.08);
                                       _cropRect = Rect.fromLTRB(
                                         nl,
                                         nt,
@@ -930,23 +1279,17 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                                     });
                                   },
                                 ),
-                                _buildCornerHandle(
-                                  left: pixelCrop.right - 14,
-                                  top: pixelCrop.top - 14,
+                                _buildTouchCorner(
+                                  left: pixelCrop.right - 18,
+                                  top: pixelCrop.top - 18,
                                   onDrag: (d) {
                                     setState(() {
                                       final double nr =
                                           (_cropRect.right + d.dx / renderW)
-                                              .clamp(
-                                                _cropRect.left + 0.12,
-                                                1.0,
-                                              );
+                                              .clamp(_cropRect.left + 0.12, 1.0);
                                       final double nt =
                                           (_cropRect.top + d.dy / renderH)
-                                              .clamp(
-                                                0.0,
-                                                _cropRect.bottom - 0.10,
-                                              );
+                                              .clamp(0.0, _cropRect.bottom - 0.08);
                                       _cropRect = Rect.fromLTRB(
                                         _cropRect.left,
                                         nt,
@@ -956,20 +1299,17 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                                     });
                                   },
                                 ),
-                                _buildCornerHandle(
-                                  left: pixelCrop.left - 14,
-                                  top: pixelCrop.bottom - 14,
+                                _buildTouchCorner(
+                                  left: pixelCrop.left - 18,
+                                  top: pixelCrop.bottom - 18,
                                   onDrag: (d) {
                                     setState(() {
                                       final double nl =
                                           (_cropRect.left + d.dx / renderW)
-                                              .clamp(
-                                                0.0,
-                                                _cropRect.right - 0.12,
-                                              );
+                                              .clamp(0.0, _cropRect.right - 0.12);
                                       final double nb =
                                           (_cropRect.bottom + d.dy / renderH)
-                                              .clamp(_cropRect.top + 0.10, 1.0);
+                                              .clamp(_cropRect.top + 0.08, 1.0);
                                       _cropRect = Rect.fromLTRB(
                                         nl,
                                         _cropRect.top,
@@ -979,20 +1319,17 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                                     });
                                   },
                                 ),
-                                _buildCornerHandle(
-                                  left: pixelCrop.right - 14,
-                                  top: pixelCrop.bottom - 14,
+                                _buildTouchCorner(
+                                  left: pixelCrop.right - 18,
+                                  top: pixelCrop.bottom - 18,
                                   onDrag: (d) {
                                     setState(() {
                                       final double nr =
                                           (_cropRect.right + d.dx / renderW)
-                                              .clamp(
-                                                _cropRect.left + 0.12,
-                                                1.0,
-                                              );
+                                              .clamp(_cropRect.left + 0.12, 1.0);
                                       final double nb =
                                           (_cropRect.bottom + d.dy / renderH)
-                                              .clamp(_cropRect.top + 0.10, 1.0);
+                                              .clamp(_cropRect.top + 0.08, 1.0);
                                       _cropRect = Rect.fromLTRB(
                                         _cropRect.left,
                                         _cropRect.top,
@@ -1010,15 +1347,12 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                     ),
                   ),
                 ),
-
-                // Quick Crop Presets & Confirm Bar
+                // Bottom Controls
                 Container(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 22),
                   decoration: const BoxDecoration(
-                    color: Color(0xFF1E293B),
-                    borderRadius: BorderRadius.vertical(
-                      top: Radius.circular(22),
-                    ),
+                    color: Color(0xFF111827),
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
                   ),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -1027,24 +1361,24 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                         scrollDirection: Axis.horizontal,
                         child: Row(
                           children: [
-                            _buildPresetChip(
+                            _buildPresetBtn(
                               'Full Page',
                               const Rect.fromLTWH(0.03, 0.03, 0.94, 0.94),
                             ),
                             const SizedBox(width: 8),
-                            _buildPresetChip(
-                              'Center Paragraph',
-                              const Rect.fromLTWH(0.08, 0.25, 0.84, 0.50),
+                            _buildPresetBtn(
+                              'Paragraph Block',
+                              const Rect.fromLTWH(0.06, 0.22, 0.88, 0.52),
                             ),
                             const SizedBox(width: 8),
-                            _buildPresetChip(
-                              'Single Line / Strip',
-                              const Rect.fromLTWH(0.08, 0.40, 0.84, 0.18),
+                            _buildPresetBtn(
+                              'Single Line / Heading',
+                              const Rect.fromLTWH(0.06, 0.42, 0.88, 0.15),
                             ),
                             const SizedBox(width: 8),
-                            _buildPresetChip(
+                            _buildPresetBtn(
                               'Top Half',
-                              const Rect.fromLTWH(0.05, 0.05, 0.90, 0.45),
+                              const Rect.fromLTWH(0.04, 0.04, 0.92, 0.45),
                             ),
                           ],
                         ),
@@ -1054,9 +1388,9 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                         width: double.infinity,
                         child: ElevatedButton.icon(
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF2563EB),
+                            backgroundColor: const Color(0xFF4F46E5),
                             foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            padding: const EdgeInsets.symmetric(vertical: 15),
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(14),
                             ),
@@ -1071,12 +1405,12 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
                                     color: Colors.white,
                                   ),
                                 )
-                              : const Icon(Icons.crop_rounded),
+                              : const Icon(Icons.document_scanner_rounded),
                           label: const Text(
-                            'Crop & Extract Text Now',
+                            'Crop & Extract Text',
                             style: TextStyle(
                               fontWeight: FontWeight.w800,
-                              fontSize: 15,
+                              fontSize: 15.5,
                             ),
                           ),
                         ),
@@ -1089,7 +1423,7 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
     );
   }
 
-  Widget _buildCornerHandle({
+  Widget _buildTouchCorner({
     required double left,
     required double top,
     required void Function(Offset delta) onDrag,
@@ -1098,75 +1432,61 @@ class _SmartImageCropStudioState extends State<_SmartImageCropStudio> {
       left: left,
       top: top,
       child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
         onPanUpdate: (d) => onDrag(d.delta),
-        child: Container(
-          width: 28,
-          height: 28,
-          decoration: BoxDecoration(
-            color: const Color(0xFF2563EB),
-            shape: BoxShape.circle,
-            border: Border.all(color: Colors.white, width: 3),
-            boxShadow: [
-              BoxShadow(color: Colors.black.withOpacity(0.35), blurRadius: 6),
-            ],
-          ),
-        ),
+        child: const SizedBox(width: 36, height: 36),
       ),
     );
   }
 
-  Widget _buildPresetChip(String label, Rect rect) {
+  Widget _buildPresetBtn(String label, Rect rect) {
     return ActionChip(
-      backgroundColor: const Color(0xFF334155),
-      side: BorderSide.none,
+      backgroundColor: const Color(0xFF1F2937),
+      side: const BorderSide(color: Color(0xFF374151)),
       label: Text(
         label,
         style: const TextStyle(
           color: Colors.white,
           fontSize: 12,
-          fontWeight: FontWeight.w600,
+          fontWeight: FontWeight.w700,
         ),
       ),
-      onPressed: () => _setPresetCrop(rect),
+      onPressed: () => setState(() => _cropRect = rect),
     );
   }
 }
 
-class _CropOverlayPainter extends CustomPainter {
+class _ProScannerOverlayPainter extends CustomPainter {
   final Rect cropRect;
 
-  _CropOverlayPainter({required this.cropRect});
+  _ProScannerOverlayPainter({required this.cropRect});
 
   @override
   void paint(Canvas canvas, Size size) {
     final Path fullPath = Path()..addRect(Offset.zero & size);
     final Path holePath = Path()
-      ..addRRect(RRect.fromRectAndRadius(cropRect, const Radius.circular(8)));
+      ..addRRect(RRect.fromRectAndRadius(cropRect, const Radius.circular(6)));
 
-    final Path overlayPath = Path.combine(
-      PathOperation.difference,
-      fullPath,
-      holePath,
-    );
+    final Path overlayPath =
+        Path.combine(PathOperation.difference, fullPath, holePath);
 
-    // Darken outside area
     canvas.drawPath(
       overlayPath,
-      Paint()..color = Colors.black.withOpacity(0.62),
+      Paint()..color = Colors.black.withOpacity(0.68),
     );
 
-    // Bright border around selected area
+    // Subtle Inner Frame
     canvas.drawRRect(
-      RRect.fromRectAndRadius(cropRect, const Radius.circular(8)),
+      RRect.fromRectAndRadius(cropRect, const Radius.circular(6)),
       Paint()
-        ..color = const Color(0xFF60A5FA)
+        ..color = Colors.white.withOpacity(0.6)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.2,
+        ..strokeWidth = 1.2,
     );
 
-    // Rule of thirds helper grid lines inside crop box
+    // Rule of Thirds Grid
     final Paint gridPaint = Paint()
-      ..color = Colors.white.withOpacity(0.35)
+      ..color = Colors.white.withOpacity(0.22)
       ..strokeWidth = 1;
 
     final double thirdW = cropRect.width / 3;
@@ -1184,9 +1504,55 @@ class _CropOverlayPainter extends CustomPainter {
         gridPaint,
       );
     }
+
+    // Pro L-Shaped Corner Brackets
+    final Paint bracketPaint = Paint()
+      ..color = const Color(0xFF38BDF8)
+      ..strokeWidth = 4.0
+      ..strokeCap = StrokeCap.round
+      ..style = PaintingStyle.stroke;
+
+    const double len = 22.0;
+    final double l = cropRect.left;
+    final double t = cropRect.top;
+    final double r = cropRect.right;
+    final double b = cropRect.bottom;
+
+    // Top-Left
+    canvas.drawPath(
+      Path()
+        ..moveTo(l, t + len)
+        ..lineTo(l, t)
+        ..lineTo(l + len, t),
+      bracketPaint,
+    );
+    // Top-Right
+    canvas.drawPath(
+      Path()
+        ..moveTo(r - len, t)
+        ..lineTo(r, t)
+        ..lineTo(r, t + len),
+      bracketPaint,
+    );
+    // Bottom-Left
+    canvas.drawPath(
+      Path()
+        ..moveTo(l, b - len)
+        ..lineTo(l, b)
+        ..lineTo(l + len, b),
+      bracketPaint,
+    );
+    // Bottom-Right
+    canvas.drawPath(
+      Path()
+        ..moveTo(r - len, b)
+        ..lineTo(r, b)
+        ..lineTo(r, b - len),
+      bracketPaint,
+    );
   }
 
   @override
-  bool shouldRepaint(covariant _CropOverlayPainter oldDelegate) =>
+  bool shouldRepaint(covariant _ProScannerOverlayPainter oldDelegate) =>
       oldDelegate.cropRect != cropRect;
 }
