@@ -1,6 +1,6 @@
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -16,7 +16,8 @@ class TextScannerScreen extends StatefulWidget {
 }
 
 class _TextScannerScreenState extends State<TextScannerScreen> {
-  final String _ocrApiKey = dotenv.env['OCR_API_KEY'] ??
+  final String _ocrApiKey =
+      dotenv.env['OCR_API_KEY'] ??
       dotenv.env['OCR_SPACE_API_KEY'] ??
       'helloworld';
 
@@ -25,9 +26,11 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   bool _isScanning = false;
   bool _isSpeaking = false;
   String _selectedLang = 'eng'; // 'eng' = English, 'hin' = Hindi
-  String _scanMode = 'Paragraph'; // 'Paragraph' (Engine 1) or 'Code/Receipt' (Engine 2)
+  String _scanMode =
+      'Paragraph'; // 'Paragraph' (Engine 1) or 'Code/Receipt' (Engine 2)
 
-  final TextEditingController _extractedTextController = TextEditingController();
+  final TextEditingController _extractedTextController =
+      TextEditingController();
   final ImagePicker _picker = ImagePicker();
   final FlutterTts _flutterTts = FlutterTts();
 
@@ -59,98 +62,29 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   }
 
   // Smart Text Formatter: Fixes 1-word-per-line issues automatically
+  // Photo ke exact line-by-line aur table layout ko preserve karne wala function
   String _cleanExtractedText(String raw, {bool forceSingleParagraph = false}) {
     if (raw.trim().isEmpty) return '';
 
+    // Windows \r\n ko normal newline banana aur columns ke tab (\t) ko clean gap dena
     String text = raw
         .replaceAll('\r\n', '\n')
         .replaceAll('\r', '\n')
-        .replaceAll('\t', ' ');
+        .replaceAll('\t', '   ');
 
+    // Sirf tabhi lines jodega jab user khud "Join Broken Lines" chip dabayega
     if (forceSingleParagraph) {
-      List<String> paragraphs = text.split(RegExp(r'\n\s*\n'));
-      return paragraphs
-          .map((p) =>
-              p.replaceAll('\n', ' ').replaceAll(RegExp(r'\s+'), ' ').trim())
-          .where((p) => p.isNotEmpty)
-          .join('\n\n');
+      return text.replaceAll('\n', ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
     }
 
+    // Default: Photo mein jaisi lines hain (Row-by-Row), bilkul waisa hi rakhega!
     List<String> lines = text
         .split('\n')
-        .map((l) => l.trim())
-        .where((l) => l.isNotEmpty)
+        .map((line) => line.trimRight())
+        .where((line) => line.trim().isNotEmpty)
         .toList();
 
-    if (lines.isEmpty) return '';
-
-    // Check if OCR broke words into separate lines (e.g., >45% of lines have <= 2 words)
-    if (lines.length > 2) {
-      int shortLines =
-          lines.where((l) => l.split(RegExp(r'\s+')).length <= 2).length;
-      if (shortLines / lines.length >= 0.45) {
-        return lines.join(' ').replaceAll(RegExp(r'\s+'), ' ').trim();
-      }
-    }
-
-    // Natural sentence stitcher
-    final StringBuffer buffer = StringBuffer();
-    for (int i = 0; i < lines.length; i++) {
-      final String current = lines[i];
-      buffer.write(current);
-
-      if (i < lines.length - 1) {
-        final bool endsWithStop = RegExp(r'[.?!।:|—]$').hasMatch(current);
-        final bool nextIsList =
-            RegExp(r'^(\d+[\.\)]|[\•\-\*])\s').hasMatch(lines[i + 1]);
-        if (endsWithStop || nextIsList) {
-          buffer.write('\n');
-        } else {
-          buffer.write(' ');
-        }
-      }
-    }
-
-    return buffer.toString().replaceAll(RegExp(r' +'), ' ').trim();
-  }
-
-  Future<void> _pickImageAndOpenCropper(ImageSource source) async {
-    try {
-      final XFile? pickedFile = await _picker.pickImage(
-        source: source,
-        maxWidth: 1920,
-        maxHeight: 1920,
-        imageQuality: 92,
-      );
-
-      if (pickedFile == null) return;
-
-      final Uint8List rawBytes = await pickedFile.readAsBytes();
-      setState(() {
-        _originalImageBytes = rawBytes;
-      });
-
-      if (!mounted) return;
-      await _openCropStudio(rawBytes);
-    } catch (e) {
-      _showSnack('Could not load image: $e');
-    }
-  }
-
-  Future<void> _openCropStudio(Uint8List sourceBytes) async {
-    final Uint8List? croppedResult = await Navigator.push<Uint8List>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => _ProCropStudioScreen(imageBytes: sourceBytes),
-      ),
-    );
-
-    if (croppedResult != null) {
-      setState(() {
-        _croppedImageBytes = croppedResult;
-      });
-      await _performOcr(croppedResult);
-    }
+    return lines.join('\n');
   }
 
   Future<void> _performOcr(Uint8List imageBytes) async {
@@ -160,21 +94,18 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       final String base64Image =
           'data:image/png;base64,${base64Encode(imageBytes)}';
 
-      // Engine 1 is always required for Hindi & natural paragraphs
-      final String engineToUse =
-          (_selectedLang == 'hin' || _scanMode == 'Paragraph') ? '1' : '2';
+      // Hindi ke liye Engine 1, aur English/Tables/Marksheet keexact alignment ke liye Engine 2
+      final String engineToUse = _selectedLang == 'hin' ? '1' : '2';
 
       final response = await http.post(
         Uri.parse('https://api.ocr.space/parse/image'),
-        headers: {
-          'apikey': _ocrApiKey.trim(),
-        },
+        headers: {'apikey': _ocrApiKey.trim()},
         body: {
           'base64Image': base64Image,
           'language': _selectedLang,
           'isOverlayRequired': 'false',
           'scale': 'true',
-          'isTable': 'false',
+          'isTable': 'true', // YEH SABSE IMPORTANT HAI: Har row ko alag line mein rakhega!
           'OCREngine': engineToUse,
         },
       );
@@ -184,8 +115,9 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
         final List? parsedResults = data['ParsedResults'];
 
         if (parsedResults != null && parsedResults.isNotEmpty) {
-          final String rawText =
-              (parsedResults[0]['ParsedText'] ?? '').toString().trim();
+          final String rawText = (parsedResults[0]['ParsedText'] ?? '')
+              .toString()
+              .trim();
 
           final String cleanedText = _cleanExtractedText(rawText);
 
@@ -253,11 +185,13 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   @override
   Widget build(BuildContext context) {
     final String currentText = _extractedTextController.text.trim();
-    final int wordCount =
-        currentText.isEmpty ? 0 : currentText.split(RegExp(r'\s+')).length;
+    final int wordCount = currentText.isEmpty
+        ? 0
+        : currentText.split(RegExp(r'\s+')).length;
     final int charCount = _extractedTextController.text.length;
-    final int lineCount =
-        currentText.isEmpty ? 0 : currentText.split('\n').length;
+    final int lineCount = currentText.isEmpty
+        ? 0
+        : currentText.split('\n').length;
 
     return Scaffold(
       backgroundColor: const Color(0xFFF1F5F9),
@@ -319,7 +253,10 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                   _isSpeaking = false;
                 });
               },
-              icon: const Icon(Icons.restart_alt_rounded, color: Color(0xFFF87171)),
+              icon: const Icon(
+                Icons.restart_alt_rounded,
+                color: Color(0xFFF87171),
+              ),
             ),
           const SizedBox(width: 4),
         ],
@@ -333,7 +270,9 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
               decoration: const BoxDecoration(
                 color: Color(0xFF0F172A),
-                borderRadius: BorderRadius.vertical(bottom: Radius.circular(28)),
+                borderRadius: BorderRadius.vertical(
+                  bottom: Radius.circular(28),
+                ),
               ),
               child: Column(
                 children: [
@@ -405,7 +344,9 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                           isPrimary: true,
                           onTap: _isScanning
                               ? null
-                              : () => _pickImageAndOpenCropper(ImageSource.gallery),
+                              : () => _pickImageAndOpenCropper(
+                                  ImageSource.gallery,
+                                ),
                         ),
                       ),
                       const SizedBox(width: 12),
@@ -417,7 +358,9 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                           isPrimary: false,
                           onTap: _isScanning
                               ? null
-                              : () => _pickImageAndOpenCropper(ImageSource.camera),
+                              : () => _pickImageAndOpenCropper(
+                                  ImageSource.camera,
+                                ),
                         ),
                       ),
                     ],
@@ -481,8 +424,13 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                     ),
                                     onPressed: _isScanning
                                         ? null
-                                        : () => _openCropStudio(_originalImageBytes!),
-                                    icon: const Icon(Icons.crop_rounded, size: 15),
+                                        : () => _openCropStudio(
+                                            _originalImageBytes!,
+                                          ),
+                                    icon: const Icon(
+                                      Icons.crop_rounded,
+                                      size: 15,
+                                    ),
                                     label: const Text(
                                       'Re-Crop',
                                       style: TextStyle(
@@ -499,7 +447,10 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                   onPressed: _isScanning
                                       ? null
                                       : () => _performOcr(_croppedImageBytes!),
-                                  icon: const Icon(Icons.refresh_rounded, size: 15),
+                                  icon: const Icon(
+                                    Icons.refresh_rounded,
+                                    size: 15,
+                                  ),
                                   label: const Text(
                                     'Rescan',
                                     style: TextStyle(
@@ -519,7 +470,9 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                             decoration: BoxDecoration(
                               color: const Color(0xFFF8FAFC),
                               borderRadius: BorderRadius.circular(14),
-                              border: Border.all(color: const Color(0xFFE2E8F0)),
+                              border: Border.all(
+                                color: const Color(0xFFE2E8F0),
+                              ),
                             ),
                             child: Stack(
                               alignment: Alignment.center,
@@ -538,7 +491,8 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                       vertical: 10,
                                     ),
                                     decoration: BoxDecoration(
-                                      color: const Color(0xFF0F172A).withOpacity(0.82),
+                                      color: const Color(0xFF0F172A)
+                                          .withOpacity(0.82),
                                       borderRadius: BorderRadius.circular(12),
                                     ),
                                     child: const Row(
@@ -645,10 +599,10 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                           final String label = rate == 0.38
                               ? '0.75x'
                               : rate == 0.5
-                                  ? '1x'
-                                  : rate == 0.65
-                                      ? '1.25x'
-                                      : '1.5x';
+                              ? '1x'
+                              : rate == 0.65
+                              ? '1.25x'
+                              : '1.5x';
                           final bool active = (_speechRate - rate).abs() < 0.05;
                           return GestureDetector(
                             onTap: () => setState(() => _speechRate = rate),
@@ -763,9 +717,9 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                   setState(() {
                                     _extractedTextController.text =
                                         _cleanExtractedText(
-                                      _extractedTextController.text,
-                                      forceSingleParagraph: true,
-                                    );
+                                          _extractedTextController.text,
+                                          forceSingleParagraph: true,
+                                        );
                                   });
                                   _showSnack(
                                     'All broken lines merged into clean sentences!',
@@ -837,8 +791,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                               fontWeight: FontWeight.w500,
                             ),
                             decoration: const InputDecoration(
-                              hintText:
-                                  '1. Upload a photo or take a picture.\n2. Drag the corner brackets to crop the exact paragraph.\n3. Clean, formatted text will appear here automatically!',
+                              hintText: '1. Upload a photo or take a picture.\n2. Drag the corner brackets to crop the exact paragraph.\n3. Clean, formatted text will appear here automatically!',
                               hintStyle: TextStyle(
                                 color: Color(0xFF94A3B8),
                                 fontSize: 13.5,
@@ -941,8 +894,8 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
               color: isPrimary
-                  ? const Color(0xFF818CF8).withOpacity(0.4)
-                  : Colors.white.withOpacity(0.1),
+                  ? const Color(0xFF818CF8).withValues(alpha: 0.4)
+                  : Colors.white.withValues(alpha: 0.1),
             ),
           ),
           child: Row(
@@ -950,7 +903,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               Container(
                 padding: const EdgeInsets.all(9),
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.14),
+                  color: Colors.white.withValues(alpha: 0.14),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(icon, color: Colors.white, size: 22),
@@ -1022,7 +975,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: const Color(0xFFE2E8F0).withOpacity(0.7),
+        color: const Color(0xFFE2E8F0).withValues(alpha: 0.7),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
@@ -1035,6 +988,10 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       ),
     );
   }
+
+  void _pickImageAndOpenCropper(ImageSource gallery) {}
+
+  void _openCropStudio(Uint8List uint8list) {}
 }
 
 // ============================================================================
@@ -1088,8 +1045,10 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
     canvas.drawImage(src, Offset.zero, Paint());
 
     final ui.Picture picture = recorder.endRecording();
-    final ui.Image rotated =
-        await picture.toImage(newWidth.toInt(), newHeight.toInt());
+    final ui.Image rotated = await picture.toImage(
+      newWidth.toInt(),
+      newHeight.toInt(),
+    );
 
     if (mounted) {
       setState(() {
@@ -1128,8 +1087,9 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
         srcRect.height.toInt(),
       );
 
-      final ByteData? byteData =
-          await croppedUiImage.toByteData(format: ui.ImageByteFormat.png);
+      final ByteData? byteData = await croppedUiImage.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
 
       if (byteData != null && mounted) {
         Navigator.pop(context, byteData.buffer.asUint8List());
@@ -1178,8 +1138,14 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
           : Column(
               children: [
                 Container(
-                  margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 20,
+                    vertical: 6,
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
                   decoration: BoxDecoration(
                     color: Colors.white.withOpacity(0.07),
                     borderRadius: BorderRadius.circular(20),
@@ -1244,8 +1210,11 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                       setState(() {
                                         final double dx = d.delta.dx / renderW;
                                         final double dy = d.delta.dy / renderH;
-                                        final double newL = (_cropRect.left + dx)
-                                            .clamp(0.0, 1.0 - _cropRect.width);
+                                        final double newL =
+                                            (_cropRect.left + dx).clamp(
+                                              0.0,
+                                              1.0 - _cropRect.width,
+                                            );
                                         final double newT = (_cropRect.top + dy)
                                             .clamp(0.0, 1.0 - _cropRect.height);
                                         _cropRect = Rect.fromLTWH(
@@ -1266,10 +1235,16 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                     setState(() {
                                       final double nl =
                                           (_cropRect.left + d.dx / renderW)
-                                              .clamp(0.0, _cropRect.right - 0.12);
+                                              .clamp(
+                                                0.0,
+                                                _cropRect.right - 0.12,
+                                              );
                                       final double nt =
                                           (_cropRect.top + d.dy / renderH)
-                                              .clamp(0.0, _cropRect.bottom - 0.08);
+                                              .clamp(
+                                                0.0,
+                                                _cropRect.bottom - 0.08,
+                                              );
                                       _cropRect = Rect.fromLTRB(
                                         nl,
                                         nt,
@@ -1286,10 +1261,16 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                     setState(() {
                                       final double nr =
                                           (_cropRect.right + d.dx / renderW)
-                                              .clamp(_cropRect.left + 0.12, 1.0);
+                                              .clamp(
+                                                _cropRect.left + 0.12,
+                                                1.0,
+                                              );
                                       final double nt =
                                           (_cropRect.top + d.dy / renderH)
-                                              .clamp(0.0, _cropRect.bottom - 0.08);
+                                              .clamp(
+                                                0.0,
+                                                _cropRect.bottom - 0.08,
+                                              );
                                       _cropRect = Rect.fromLTRB(
                                         _cropRect.left,
                                         nt,
@@ -1306,7 +1287,10 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                     setState(() {
                                       final double nl =
                                           (_cropRect.left + d.dx / renderW)
-                                              .clamp(0.0, _cropRect.right - 0.12);
+                                              .clamp(
+                                                0.0,
+                                                _cropRect.right - 0.12,
+                                              );
                                       final double nb =
                                           (_cropRect.bottom + d.dy / renderH)
                                               .clamp(_cropRect.top + 0.08, 1.0);
@@ -1326,7 +1310,10 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                     setState(() {
                                       final double nr =
                                           (_cropRect.right + d.dx / renderW)
-                                              .clamp(_cropRect.left + 0.12, 1.0);
+                                              .clamp(
+                                                _cropRect.left + 0.12,
+                                                1.0,
+                                              );
                                       final double nb =
                                           (_cropRect.bottom + d.dy / renderH)
                                               .clamp(_cropRect.top + 0.08, 1.0);
@@ -1352,7 +1339,9 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                   padding: const EdgeInsets.fromLTRB(16, 14, 16, 22),
                   decoration: const BoxDecoration(
                     color: Color(0xFF111827),
-                    borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                    borderRadius: BorderRadius.vertical(
+                      top: Radius.circular(24),
+                    ),
                   ),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -1467,8 +1456,11 @@ class _ProScannerOverlayPainter extends CustomPainter {
     final Path holePath = Path()
       ..addRRect(RRect.fromRectAndRadius(cropRect, const Radius.circular(6)));
 
-    final Path overlayPath =
-        Path.combine(PathOperation.difference, fullPath, holePath);
+    final Path overlayPath = Path.combine(
+      PathOperation.difference,
+      fullPath,
+      holePath,
+    );
 
     canvas.drawPath(
       overlayPath,
