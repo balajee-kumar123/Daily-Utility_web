@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -25,16 +27,18 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   Uint8List? _croppedImageBytes;
   bool _isScanning = false;
   bool _isSpeaking = false;
+
   String _selectedLang = 'eng'; // 'eng' = English, 'hin' = Hindi
-  String _scanMode =
-      'Paragraph'; // 'Paragraph' (Engine 1) or 'Code/Receipt' (Engine 2)
+  bool _preserveExactLayout = true; // True = Exact 2D Spatial / Table Layout
 
   final TextEditingController _extractedTextController =
       TextEditingController();
+  final ScrollController _horizontalScrollController = ScrollController();
   final ImagePicker _picker = ImagePicker();
   final FlutterTts _flutterTts = FlutterTts();
 
-  double _speechRate = 0.5; // 0.5 in flutter_tts = 1.0x normal speed
+  double _speechRate = 0.5;
+  double _editorFontSize = 13.5;
 
   @override
   void initState() {
@@ -58,33 +62,214 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
   void dispose() {
     _flutterTts.stop();
     _extractedTextController.dispose();
+    _horizontalScrollController.dispose();
     super.dispose();
   }
 
-  // Smart Text Formatter: Fixes 1-word-per-line issues automatically
-  // Photo ke exact line-by-line aur table layout ko preserve karne wala function
-  String _cleanExtractedText(String raw, {bool forceSingleParagraph = false}) {
-    if (raw.trim().isEmpty) return '';
+  // ==========================================================================
+  // 2D SPATIAL LAYOUT RECONSTRUCTION ENGINE (ZERO SPACE SHIFT)
+  // ==========================================================================
+  String _buildExactSpatialText(Map<String, dynamic> parsedResult) {
+    try {
+      final overlay = parsedResult['TextOverlay'];
+      final List? rawLines = overlay != null ? overlay['Lines'] : null;
 
-    // Windows \r\n ko normal newline banana aur columns ke tab (\t) ko clean gap dena
-    String text = raw
+      if (rawLines == null || rawLines.isEmpty) {
+        return _cleanBasicRawText(
+          (parsedResult['ParsedText'] ?? '').toString(),
+        );
+      }
+
+      // Extract every individual word with its exact bounding box (Left, Top, Width, Height)
+      final List<_OcrWordBox> allWords = [];
+      double totalCharWidth = 0;
+      int totalChars = 0;
+      double totalHeight = 0;
+
+      for (final line in rawLines) {
+        final List? words = line['Words'];
+        if (words == null) continue;
+        for (final w in words) {
+          final String text = (w['WordText'] ?? '').toString().trim();
+          if (text.isEmpty) continue;
+
+          final double left = (w['Left'] as num?)?.toDouble() ?? 0.0;
+          final double top = (w['Top'] as num?)?.toDouble() ?? 0.0;
+          final double width = (w['Width'] as num?)?.toDouble() ?? 10.0;
+          final double height = (w['Height'] as num?)?.toDouble() ?? 14.0;
+
+          allWords.add(
+            _OcrWordBox(
+              text: text,
+              left: left,
+              top: top,
+              width: width,
+              height: height,
+            ),
+          );
+
+          totalCharWidth += width;
+          totalChars += text.length;
+          totalHeight += height;
+        }
+      }
+
+      if (allWords.isEmpty) {
+        return _cleanBasicRawText(
+          (parsedResult['ParsedText'] ?? '').toString(),
+        );
+      }
+
+      final double avgCharPx = totalChars > 0
+          ? (totalCharWidth / totalChars).clamp(4.0, 28.0)
+          : 8.0;
+      final double avgWordHeight = (totalHeight / allWords.length).clamp(
+        8.0,
+        60.0,
+      );
+
+      // Sort words top-to-bottom
+      allWords.sort((a, b) => a.centerY.compareTo(b.centerY));
+
+      // Group words into horizontal rows based on Y-coordinate overlap
+      final List<List<_OcrWordBox>> rows = [];
+      final double rowThreshold = avgWordHeight * 0.55;
+
+      for (final word in allWords) {
+        bool placed = false;
+        for (final row in rows) {
+          final double rowAvgCenterY =
+              row.map((e) => e.centerY).reduce((a, b) => a + b) / row.length;
+          if ((word.centerY - rowAvgCenterY).abs() <= rowThreshold) {
+            row.add(word);
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) {
+          rows.add([word]);
+        }
+      }
+
+      // Sort rows top-to-bottom, and words inside each row left-to-right
+      rows.sort((a, b) {
+        final double ay = a.map((e) => e.top).reduce(math.min);
+        final double by = b.map((e) => e.top).reduce(math.min);
+        return ay.compareTo(by);
+      });
+
+      for (final row in rows) {
+        row.sort((a, b) => a.left.compareTo(b.left));
+      }
+
+      // Find minimum left margin across the entire cropped image
+      final double minLeft = allWords.map((e) => e.left).reduce(math.min);
+
+      final List<String> outputLines = [];
+      double? prevRowBottom;
+
+      for (final row in rows) {
+        final double rowTop = row.map((e) => e.top).reduce(math.min);
+        final double rowBottom = row.map((e) => e.bottom).reduce(math.max);
+
+        // Preserve empty vertical gap between separated sections/paragraphs
+        if (prevRowBottom != null &&
+            (rowTop - prevRowBottom) > avgWordHeight * 1.45) {
+          outputLines.add('');
+        }
+        prevRowBottom = rowBottom;
+
+        final StringBuffer lineBuf = StringBuffer();
+        double currentRightPx = minLeft;
+
+        for (int i = 0; i < row.length; i++) {
+          final _OcrWordBox w = row[i];
+          final double gapPx = w.left - currentRightPx;
+
+          if (i == 0) {
+            // Left indentation spaces
+            final int indentSpaces = (gapPx / (avgCharPx * 1.15)).round().clamp(
+              0,
+              18,
+            );
+            if (indentSpaces > 1) {
+              lineBuf.write(' ' * indentSpaces);
+            }
+          } else {
+            // Exact proportional spacing between words / table columns
+            if (gapPx <= avgCharPx * 1.5) {
+              lineBuf.write(' ');
+            } else {
+              final int spaces = (gapPx / (avgCharPx * 0.95)).round().clamp(
+                2,
+                24,
+              );
+              lineBuf.write(' ' * spaces);
+            }
+          }
+
+          lineBuf.write(w.text);
+          currentRightPx = math.max(currentRightPx, w.right);
+        }
+
+        outputLines.add(lineBuf.toString().trimRight());
+      }
+
+      return outputLines.join('\n');
+    } catch (_) {
+      return _cleanBasicRawText((parsedResult['ParsedText'] ?? '').toString());
+    }
+  }
+
+  String _cleanBasicRawText(String raw) {
+    if (raw.trim().isEmpty) return '';
+    return raw
         .replaceAll('\r\n', '\n')
         .replaceAll('\r', '\n')
-        .replaceAll('\t', '   ');
-
-    // Sirf tabhi lines jodega jab user khud "Join Broken Lines" chip dabayega
-    if (forceSingleParagraph) {
-      return text.replaceAll('\n', ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
-    }
-
-    // Default: Photo mein jaisi lines hain (Row-by-Row), bilkul waisa hi rakhega!
-    List<String> lines = text
+        .replaceAll('\t', '    ')
         .split('\n')
         .map((line) => line.trimRight())
-        .where((line) => line.trim().isNotEmpty)
-        .toList();
+        .join('\n')
+        .trim();
+  }
 
-    return lines.join('\n');
+  Future<void> _pickImageAndOpenCropper(ImageSource source) async {
+    try {
+      final XFile? pickedFile = await _picker.pickImage(
+        source: source,
+        maxWidth: 2000,
+        maxHeight: 2000,
+        imageQuality: 95,
+      );
+
+      if (pickedFile == null) return;
+
+      final Uint8List rawBytes = await pickedFile.readAsBytes();
+      setState(() {
+        _originalImageBytes = rawBytes;
+      });
+
+      if (!mounted) return;
+      await _openCropStudio(rawBytes);
+    } catch (e) {
+      _showSnack('Could not load image: $e');
+    }
+  }
+
+  Future<void> _openCropStudio(Uint8List sourceBytes) async {
+    final Uint8List? croppedResult = await Navigator.push<Uint8List>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _ProCropStudioScreen(imageBytes: sourceBytes),
+      ),
+    );
+
+    if (croppedResult != null) {
+      setState(() {
+        _croppedImageBytes = croppedResult;
+      });
+      await _performOcr(croppedResult);
+    }
   }
 
   Future<void> _performOcr(Uint8List imageBytes) async {
@@ -94,7 +279,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       final String base64Image =
           'data:image/png;base64,${base64Encode(imageBytes)}';
 
-      // Hindi ke liye Engine 1, aur English/Tables/Marksheet keexact alignment ke liye Engine 2
+      // Engine 1 for Hindi, Engine 2 for high-precision English/Tables/Numbers
       final String engineToUse = _selectedLang == 'hin' ? '1' : '2';
 
       final response = await http.post(
@@ -103,9 +288,11 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
         body: {
           'base64Image': base64Image,
           'language': _selectedLang,
-          'isOverlayRequired': 'false',
+          'isOverlayRequired':
+              'true', // Fetches exact X, Y coordinates of every word
+          'isTable': 'true', // Preserves row-by-row table structure
           'scale': 'true',
-          'isTable': 'true', // YEH SABSE IMPORTANT HAI: Har row ko alag line mein rakhega!
+          'detectOrientation': 'true',
           'OCREngine': engineToUse,
         },
       );
@@ -115,16 +302,20 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
         final List? parsedResults = data['ParsedResults'];
 
         if (parsedResults != null && parsedResults.isNotEmpty) {
-          final String rawText = (parsedResults[0]['ParsedText'] ?? '')
-              .toString()
-              .trim();
+          final Map<String, dynamic> firstResult = Map<String, dynamic>.from(
+            parsedResults[0],
+          );
 
-          final String cleanedText = _cleanExtractedText(rawText);
+          final String finalOutput = _preserveExactLayout
+              ? _buildExactSpatialText(firstResult)
+              : _cleanBasicRawText(
+                  (firstResult['ParsedText'] ?? '').toString(),
+                );
 
           setState(() {
-            _extractedTextController.text = cleanedText.isEmpty
+            _extractedTextController.text = finalOutput.isEmpty
                 ? 'No readable text detected in this area. Try cropping closer to the text.'
-                : cleanedText;
+                : finalOutput;
           });
         } else {
           final String err =
@@ -156,18 +347,18 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       await _flutterTts.setSpeechRate(_speechRate);
       await _flutterTts.setPitch(1.0);
       setState(() => _isSpeaking = true);
-      await _flutterTts.speak(text);
+      await _flutterTts.speak(text.replaceAll(RegExp(r' {2,}'), ', '));
     }
   }
 
   void _copyText() {
-    final text = _extractedTextController.text.trim();
-    if (text.isEmpty) {
+    final text = _extractedTextController.text;
+    if (text.trim().isEmpty) {
       _showSnack('Nothing to copy yet!');
       return;
     }
     Clipboard.setData(ClipboardData(text: text));
-    _showSnack('Copied to clipboard!');
+    _showSnack('Exact formatted text copied to clipboard!');
   }
 
   void _showSnack(String msg) {
@@ -191,7 +382,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     final int charCount = _extractedTextController.text.length;
     final int lineCount = currentText.isEmpty
         ? 0
-        : currentText.split('\n').length;
+        : _extractedTextController.text.split('\n').length;
 
     return Scaffold(
       backgroundColor: const Color(0xFFF1F5F9),
@@ -221,7 +412,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Vision OCR Studio',
+                  'Vision OCR Studio Pro',
                   style: TextStyle(
                     fontWeight: FontWeight.w800,
                     fontSize: 16.5,
@@ -229,7 +420,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                   ),
                 ),
                 Text(
-                  'Smart Crop • Paragraph AI • Voice Reader',
+                  'Exact 1:1 Spatial Layout • Smart Crop • Voice AI',
                   style: TextStyle(
                     fontSize: 10.5,
                     color: Color(0xFF94A3B8),
@@ -264,7 +455,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       body: SingleChildScrollView(
         child: Column(
           children: [
-            // 1. TOP DARK HERO CONTROL DECK
+            // 1. TOP HERO CONTROL DECK
             Container(
               width: double.infinity,
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
@@ -276,28 +467,29 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               ),
               child: Column(
                 children: [
-                  // Language & Mode Segmented Bar
+                  // Language & Exact Layout Toggle Bar
                   Container(
                     padding: const EdgeInsets.all(5),
                     decoration: BoxDecoration(
                       color: const Color(0xFF1E293B),
                       borderRadius: BorderRadius.circular(14),
-                      border: Border.all(color: Colors.white.withOpacity(0.07)),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
                     ),
                     child: Row(
                       children: [
                         _buildLangTab('eng', '🇬🇧 English'),
                         const SizedBox(width: 6),
-                        _buildLangTab('hin', '🇮🇳 हिंदी (Hindi)'),
+                        _buildLangTab('hin', '🇮🇳 हिंदी'),
                         const Spacer(),
-                        // Mode badge
+                        // Exact Layout Lock Toggle
                         GestureDetector(
                           onTap: () {
                             setState(() {
-                              _scanMode = _scanMode == 'Paragraph'
-                                  ? 'Receipt/Numbers'
-                                  : 'Paragraph';
+                              _preserveExactLayout = !_preserveExactLayout;
                             });
+                            if (_croppedImageBytes != null) {
+                              _performOcr(_croppedImageBytes!);
+                            }
                           },
                           child: Container(
                             padding: const EdgeInsets.symmetric(
@@ -305,23 +497,38 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                               vertical: 7,
                             ),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF334155),
+                              color: _preserveExactLayout
+                                  ? const Color(0xFF10B981).withOpacity(0.2)
+                                  : const Color(0xFF334155),
                               borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: _preserveExactLayout
+                                    ? const Color(0xFF10B981)
+                                    : Colors.transparent,
+                              ),
                             ),
                             child: Row(
                               children: [
-                                const Icon(
-                                  Icons.auto_awesome_rounded,
+                                Icon(
+                                  _preserveExactLayout
+                                      ? Icons.grid_on_rounded
+                                      : Icons.notes_rounded,
                                   size: 13,
-                                  color: Color(0xFF38BDF8),
+                                  color: _preserveExactLayout
+                                      ? const Color(0xFF34D399)
+                                      : Colors.white70,
                                 ),
                                 const SizedBox(width: 5),
                                 Text(
-                                  _scanMode,
-                                  style: const TextStyle(
-                                    color: Colors.white,
+                                  _preserveExactLayout
+                                      ? 'Exact 1:1 Layout'
+                                      : 'Paragraph Mode',
+                                  style: TextStyle(
+                                    color: _preserveExactLayout
+                                        ? const Color(0xFF34D399)
+                                        : Colors.white,
                                     fontSize: 11,
-                                    fontWeight: FontWeight.w700,
+                                    fontWeight: FontWeight.w800,
                                   ),
                                 ),
                               ],
@@ -333,7 +540,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                   ),
                   const SizedBox(height: 14),
 
-                  // Dual Upload & Camera Cards
+                  // Upload & Camera Action Cards
                   Row(
                     children: [
                       Expanded(
@@ -373,7 +580,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
-                  // 2. CROPPED IMAGE PREVIEW CARD (Shows when image is selected)
+                  // 2. CROPPED IMAGE PREVIEW CARD
                   if (_croppedImageBytes != null)
                     Container(
                       margin: const EdgeInsets.only(bottom: 16),
@@ -407,7 +614,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                 const SizedBox(width: 8),
                                 Text(
                                   _isScanning
-                                      ? 'AI Scanning in Progress...'
+                                      ? 'Mapping Exact Coordinates...'
                                       : 'Cropped Region Ready',
                                   style: const TextStyle(
                                     fontWeight: FontWeight.w800,
@@ -466,7 +673,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                             width: double.infinity,
                             margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
                             padding: const EdgeInsets.all(8),
-                            constraints: const BoxConstraints(maxHeight: 165),
+                            constraints: const BoxConstraints(maxHeight: 170),
                             decoration: BoxDecoration(
                               color: const Color(0xFFF8FAFC),
                               borderRadius: BorderRadius.circular(14),
@@ -492,7 +699,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                     ),
                                     decoration: BoxDecoration(
                                       color: const Color(0xFF0F172A)
-                                          .withOpacity(0.82),
+                                          .withOpacity(0.85),
                                       borderRadius: BorderRadius.circular(12),
                                     ),
                                     child: const Row(
@@ -508,7 +715,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                         ),
                                         SizedBox(width: 10),
                                         Text(
-                                          'Reading lines...',
+                                          'Preserving exact layout...',
                                           style: TextStyle(
                                             color: Colors.white,
                                             fontWeight: FontWeight.w700,
@@ -594,7 +801,6 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                             ],
                           ),
                         ),
-                        // Speed Selector Pills
                         ...[0.38, 0.5, 0.65, 0.8].map((rate) {
                           final String label = rate == 0.38
                               ? '0.75x'
@@ -637,7 +843,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
 
                   const SizedBox(height: 16),
 
-                  // 4. SMART TEXT WORKSPACE CARD
+                  // 4. EXACT LAYOUT WORKSPACE CARD
                   Container(
                     decoration: BoxDecoration(
                       color: Colors.white,
@@ -654,27 +860,68 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        // Header + Action Toolbar
+                        // Header + Zoom & Copy Controls
                         Padding(
                           padding: const EdgeInsets.fromLTRB(16, 14, 14, 10),
                           child: Row(
                             children: [
                               const Icon(
-                                Icons.article_rounded,
+                                Icons.table_chart_rounded,
                                 size: 19,
                                 color: Color(0xFF4F46E5),
                               ),
                               const SizedBox(width: 8),
-                              const Text(
-                                'Extracted Text Studio',
-                                style: TextStyle(
-                                  fontWeight: FontWeight.w800,
-                                  fontSize: 15,
-                                  color: Color(0xFF0F172A),
+                              const Expanded(
+                                child: Text(
+                                  'Extracted Output Studio',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 15,
+                                    color: Color(0xFF0F172A),
+                                  ),
                                 ),
                               ),
-                              const Spacer(),
-                              // 1-Click Copy Button
+                              // Font Size Zoom Controls
+                              Container(
+                                margin: const EdgeInsets.only(right: 8),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFF1F5F9),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Row(
+                                  children: [
+                                    InkWell(
+                                      onTap: () {
+                                        if (_editorFontSize > 10) {
+                                          setState(() => _editorFontSize -= 1);
+                                        }
+                                      },
+                                      child: const Padding(
+                                        padding: EdgeInsets.all(6),
+                                        child: Icon(Icons.remove, size: 15),
+                                      ),
+                                    ),
+                                    Text(
+                                      '${_editorFontSize.toInt()}px',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    InkWell(
+                                      onTap: () {
+                                        if (_editorFontSize < 22) {
+                                          setState(() => _editorFontSize += 1);
+                                        }
+                                      },
+                                      child: const Padding(
+                                        padding: EdgeInsets.all(6),
+                                        child: Icon(Icons.add, size: 15),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                               ElevatedButton.icon(
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: const Color(0xFF4F46E5),
@@ -703,41 +950,42 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                           ),
                         ),
 
-                        // Quick Text Cleanup Chips (Fixes broken lines in 1 click)
+                        // Formatting Action Bar
                         SingleChildScrollView(
                           scrollDirection: Axis.horizontal,
                           padding: const EdgeInsets.symmetric(horizontal: 14),
                           child: Row(
                             children: [
                               _buildTextToolChip(
-                                icon: Icons.wrap_text_rounded,
-                                label: 'Join Broken Lines',
+                                icon: _preserveExactLayout
+                                    ? Icons.lock_rounded
+                                    : Icons.wrap_text_rounded,
+                                label: _preserveExactLayout
+                                    ? '1:1 Table Lock: ON (No Wrap)'
+                                    : 'Word Wrap: ON',
+                                isActive: _preserveExactLayout,
                                 onTap: () {
-                                  if (currentText.isEmpty) return;
                                   setState(() {
-                                    _extractedTextController.text =
-                                        _cleanExtractedText(
-                                          _extractedTextController.text,
-                                          forceSingleParagraph: true,
-                                        );
+                                    _preserveExactLayout =
+                                        !_preserveExactLayout;
                                   });
-                                  _showSnack(
-                                    'All broken lines merged into clean sentences!',
-                                  );
                                 },
                               ),
                               const SizedBox(width: 8),
                               _buildTextToolChip(
-                                icon: Icons.space_bar_rounded,
-                                label: 'Clean Extra Spaces',
+                                icon: Icons.notes_rounded,
+                                label: 'Merge into Paragraph',
                                 onTap: () {
                                   if (currentText.isEmpty) return;
                                   setState(() {
+                                    _preserveExactLayout = false;
                                     _extractedTextController.text =
                                         _extractedTextController.text
-                                            .replaceAll(RegExp(r'[ \t]+'), ' ')
+                                            .replaceAll('\n', ' ')
+                                            .replaceAll(RegExp(r'\s+'), ' ')
                                             .trim();
                                   });
+                                  _showSnack('Merged into single paragraph!');
                                 },
                               ),
                               const SizedBox(width: 8),
@@ -770,36 +1018,76 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                           ),
                         ),
 
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 10),
                         const Divider(height: 1, color: Color(0xFFE2E8F0)),
 
-                        // Editable Text Area
-                        Padding(
+                        // EXACT MONOSPACE / HORIZONTAL SCROLLABLE TEXT CANVAS
+                        Container(
+                          width: double.infinity,
+                          color: const Color(0xFFFAFAFA),
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 6,
+                            horizontal: 14,
+                            vertical: 8,
                           ),
-                          child: TextField(
-                            controller: _extractedTextController,
-                            maxLines: 12,
-                            minLines: 7,
-                            onChanged: (_) => setState(() {}),
-                            style: const TextStyle(
-                              fontSize: 15,
-                              height: 1.6,
-                              color: Color(0xFF1E293B),
-                              fontWeight: FontWeight.w500,
-                            ),
-                            decoration: const InputDecoration(
-                              hintText: '1. Upload a photo or take a picture.\n2. Drag the corner brackets to crop the exact paragraph.\n3. Clean, formatted text will appear here automatically!',
-                              hintStyle: TextStyle(
-                                color: Color(0xFF94A3B8),
-                                fontSize: 13.5,
-                                height: 1.6,
-                              ),
-                              border: InputBorder.none,
-                            ),
-                          ),
+                          child: _preserveExactLayout
+                              ? Scrollbar(
+                                  controller: _horizontalScrollController,
+                                  thumbVisibility: true,
+                                  child: SingleChildScrollView(
+                                    controller: _horizontalScrollController,
+                                    scrollDirection: Axis.horizontal,
+                                    child: ConstrainedBox(
+                                      constraints: BoxConstraints(
+                                        minWidth:
+                                            MediaQuery.of(context).size.width -
+                                            64,
+                                        maxWidth: 1800,
+                                      ),
+                                      child: IntrinsicWidth(
+                                        child: TextField(
+                                          controller: _extractedTextController,
+                                          maxLines: null,
+                                          minLines: 9,
+                                          onChanged: (_) => setState(() {}),
+                                          style: TextStyle(
+                                            fontFamily: 'monospace',
+                                            fontSize: _editorFontSize,
+                                            height: 1.55,
+                                            color: const Color(0xFF0F172A),
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          decoration: const InputDecoration(
+                                            hintText: '1. Upload Marksheet, Table, Receipt or Book Page.\n2. Exact row & column alignment will appear here without breaking lines!\n3. Scroll horizontally if the table is wide.',
+                                            hintStyle: TextStyle(
+                                              fontFamily: 'Roboto',
+                                              color: Color(0xFF94A3B8),
+                                              fontSize: 13.5,
+                                              height: 1.6,
+                                            ),
+                                            border: InputBorder.none,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              : TextField(
+                                  controller: _extractedTextController,
+                                  maxLines: 14,
+                                  minLines: 8,
+                                  onChanged: (_) => setState(() {}),
+                                  style: TextStyle(
+                                    fontSize: _editorFontSize + 1,
+                                    height: 1.6,
+                                    color: const Color(0xFF1E293B),
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                  decoration: const InputDecoration(
+                                    hintText:
+                                        'Extracted text will appear here...',
+                                    border: InputBorder.none,
+                                  ),
+                                ),
                         ),
 
                         // Bottom Stats Footer
@@ -816,11 +1104,11 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                           ),
                           child: Row(
                             children: [
+                              _buildStatBadge('$lineCount Rows/Lines'),
+                              const SizedBox(width: 8),
                               _buildStatBadge('$wordCount Words'),
                               const SizedBox(width: 8),
                               _buildStatBadge('$charCount Chars'),
-                              const SizedBox(width: 8),
-                              _buildStatBadge('$lineCount Lines'),
                               const Spacer(),
                               if (currentText.isNotEmpty)
                                 InkWell(
@@ -829,7 +1117,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
                                     setState(() {});
                                   },
                                   child: const Text(
-                                    'Clear',
+                                    'Clear Text',
                                     style: TextStyle(
                                       fontSize: 12,
                                       fontWeight: FontWeight.w800,
@@ -894,8 +1182,8 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
               color: isPrimary
-                  ? const Color(0xFF818CF8).withValues(alpha: 0.4)
-                  : Colors.white.withValues(alpha: 0.1),
+                  ? const Color(0xFF818CF8).withOpacity(0.4)
+                  : Colors.white.withOpacity(0.1),
             ),
           ),
           child: Row(
@@ -903,7 +1191,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
               Container(
                 padding: const EdgeInsets.all(9),
                 decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.14),
+                  color: Colors.white.withOpacity(0.14),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(icon, color: Colors.white, size: 22),
@@ -942,6 +1230,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     required IconData icon,
     required String label,
     required VoidCallback onTap,
+    bool isActive = false,
   }) {
     return InkWell(
       borderRadius: BorderRadius.circular(10),
@@ -949,20 +1238,30 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          color: const Color(0xFFF1F5F9),
+          color: isActive ? const Color(0xFFEEF2FF) : const Color(0xFFF1F5F9),
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: const Color(0xFFE2E8F0)),
+          border: Border.all(
+            color: isActive ? const Color(0xFF6366F1) : const Color(0xFFE2E8F0),
+          ),
         ),
         child: Row(
           children: [
-            Icon(icon, size: 15, color: const Color(0xFF475569)),
+            Icon(
+              icon,
+              size: 14,
+              color: isActive
+                  ? const Color(0xFF4F46E5)
+                  : const Color(0xFF475569),
+            ),
             const SizedBox(width: 5),
             Text(
               label,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 11.5,
                 fontWeight: FontWeight.w700,
-                color: Color(0xFF334155),
+                color: isActive
+                    ? const Color(0xFF4F46E5)
+                    : const Color(0xFF334155),
               ),
             ),
           ],
@@ -975,7 +1274,7 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: const Color(0xFFE2E8F0).withValues(alpha: 0.7),
+        color: const Color(0xFFE2E8F0).withOpacity(0.7),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
@@ -988,10 +1287,27 @@ class _TextScannerScreenState extends State<TextScannerScreen> {
       ),
     );
   }
+}
 
-  void _pickImageAndOpenCropper(ImageSource gallery) {}
+// Helper Model for 2D Spatial Word Coordinates
+class _OcrWordBox {
+  final String text;
+  final double left;
+  final double top;
+  final double width;
+  final double height;
 
-  void _openCropStudio(Uint8List uint8list) {}
+  _OcrWordBox({
+    required this.text,
+    required this.left,
+    required this.top,
+    required this.width,
+    required this.height,
+  });
+
+  double get right => left + width;
+  double get bottom => top + height;
+  double get centerY => top + (height / 2.0);
 }
 
 // ============================================================================
@@ -1010,8 +1326,7 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
   ui.Image? _decodedImage;
   bool _isProcessing = false;
 
-  // Normalized Crop Box (0.0 to 1.0)
-  Rect _cropRect = const Rect.fromLTWH(0.08, 0.15, 0.84, 0.65);
+  Rect _cropRect = const Rect.fromLTWH(0.06, 0.12, 0.88, 0.74);
 
   @override
   void initState() {
@@ -1041,7 +1356,7 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
     final double newHeight = src.width.toDouble();
 
     canvas.translate(newWidth, 0);
-    canvas.rotate(3.141592653589793 / 2);
+    canvas.rotate(math.pi / 2);
     canvas.drawImage(src, Offset.zero, Paint());
 
     final ui.Picture picture = recorder.endRecording();
@@ -1053,7 +1368,7 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
     if (mounted) {
       setState(() {
         _decodedImage = rotated;
-        _cropRect = const Rect.fromLTWH(0.08, 0.15, 0.84, 0.65);
+        _cropRect = const Rect.fromLTWH(0.06, 0.12, 0.88, 0.74);
         _isProcessing = false;
       });
     }
@@ -1121,10 +1436,10 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
           ),
           TextButton(
             onPressed: () => setState(
-              () => _cropRect = const Rect.fromLTWH(0.02, 0.02, 0.96, 0.96),
+              () => _cropRect = const Rect.fromLTWH(0.01, 0.01, 0.98, 0.98),
             ),
             child: const Text(
-              'Select All',
+              'Full Image',
               style: TextStyle(
                 color: Color(0xFF818CF8),
                 fontWeight: FontWeight.w800,
@@ -1151,7 +1466,7 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                     borderRadius: BorderRadius.circular(20),
                   ),
                   child: const Text(
-                    'Drag corners or center box to frame the exact paragraph',
+                    'Drag blue L-corners to frame the table or paragraph accurately',
                     style: TextStyle(color: Colors.white70, fontSize: 12),
                   ),
                 ),
@@ -1201,7 +1516,6 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                     ),
                                   ),
                                 ),
-                                // Drag Inside Box
                                 Positioned.fromRect(
                                   rect: pixelCrop,
                                   child: GestureDetector(
@@ -1227,7 +1541,6 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                     },
                                   ),
                                 ),
-                                // 4 Corner Touch Zones
                                 _buildTouchCorner(
                                   left: pixelCrop.left - 18,
                                   top: pixelCrop.top - 18,
@@ -1334,7 +1647,6 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                     ),
                   ),
                 ),
-                // Bottom Controls
                 Container(
                   padding: const EdgeInsets.fromLTRB(16, 14, 16, 22),
                   decoration: const BoxDecoration(
@@ -1351,23 +1663,18 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                         child: Row(
                           children: [
                             _buildPresetBtn(
-                              'Full Page',
-                              const Rect.fromLTWH(0.03, 0.03, 0.94, 0.94),
+                              'Full Table / Page',
+                              const Rect.fromLTWH(0.02, 0.02, 0.96, 0.96),
                             ),
                             const SizedBox(width: 8),
                             _buildPresetBtn(
-                              'Paragraph Block',
-                              const Rect.fromLTWH(0.06, 0.22, 0.88, 0.52),
+                              'Center Block',
+                              const Rect.fromLTWH(0.06, 0.20, 0.88, 0.56),
                             ),
                             const SizedBox(width: 8),
                             _buildPresetBtn(
-                              'Single Line / Heading',
-                              const Rect.fromLTWH(0.06, 0.42, 0.88, 0.15),
-                            ),
-                            const SizedBox(width: 8),
-                            _buildPresetBtn(
-                              'Top Half',
-                              const Rect.fromLTWH(0.04, 0.04, 0.92, 0.45),
+                              'Single Row / Strip',
+                              const Rect.fromLTWH(0.05, 0.42, 0.90, 0.15),
                             ),
                           ],
                         ),
@@ -1396,7 +1703,7 @@ class _ProCropStudioScreenState extends State<_ProCropStudioScreen> {
                                 )
                               : const Icon(Icons.document_scanner_rounded),
                           label: const Text(
-                            'Crop & Extract Text',
+                            'Crop & Extract Exact Layout',
                             style: TextStyle(
                               fontWeight: FontWeight.w800,
                               fontSize: 15.5,
@@ -1467,7 +1774,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
       Paint()..color = Colors.black.withOpacity(0.68),
     );
 
-    // Subtle Inner Frame
     canvas.drawRRect(
       RRect.fromRectAndRadius(cropRect, const Radius.circular(6)),
       Paint()
@@ -1476,7 +1782,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
         ..strokeWidth = 1.2,
     );
 
-    // Rule of Thirds Grid
     final Paint gridPaint = Paint()
       ..color = Colors.white.withOpacity(0.22)
       ..strokeWidth = 1;
@@ -1497,7 +1802,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
       );
     }
 
-    // Pro L-Shaped Corner Brackets
     final Paint bracketPaint = Paint()
       ..color = const Color(0xFF38BDF8)
       ..strokeWidth = 4.0
@@ -1510,7 +1814,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
     final double r = cropRect.right;
     final double b = cropRect.bottom;
 
-    // Top-Left
     canvas.drawPath(
       Path()
         ..moveTo(l, t + len)
@@ -1518,7 +1821,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
         ..lineTo(l + len, t),
       bracketPaint,
     );
-    // Top-Right
     canvas.drawPath(
       Path()
         ..moveTo(r - len, t)
@@ -1526,7 +1828,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
         ..lineTo(r, t + len),
       bracketPaint,
     );
-    // Bottom-Left
     canvas.drawPath(
       Path()
         ..moveTo(l, b - len)
@@ -1534,7 +1835,6 @@ class _ProScannerOverlayPainter extends CustomPainter {
         ..lineTo(l + len, b),
       bracketPaint,
     );
-    // Bottom-Right
     canvas.drawPath(
       Path()
         ..moveTo(r - len, b)
