@@ -22,6 +22,7 @@ import 'study_timer_screen.dart';
 import 'todo_screen.dart';
 import 'weather_screen.dart';
 import 'wifi_drop_screen.dart';
+import 'text_scanner_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -202,6 +203,15 @@ class _HomeDashboardScreenState extends State<HomeDashboardScreen> {
       icon: Icons.wifi_tethering_rounded,
       color: const Color(0xFF0EA5E9),
       screenBuilder: () => const WifiDropScreen(),
+    ),
+    ToolItem(
+      id: 'ocr',
+      title: 'Text Scanner',
+      subtitle: 'Image to text OCR & voice reader',
+      category: 'Utilities',
+      icon: Icons.document_scanner_rounded,
+      color: const Color(0xFF4F46E5),
+      screenBuilder: () => const TextScannerScreen(),
     ),
     ToolItem(
       id: 'password',
